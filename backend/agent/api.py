@@ -1,23 +1,47 @@
-"""FastAPI server exposing the monitoring agent via REST and WebSocket."""
+"""api.py — FastAPI REST + WebSocket interface.
+
+The dashboard is served under ``/api`` (the Vite dev server proxies ``/api``
+and ``/ws`` to this backend).  The monitoring agent runs in simulation mode
+by default so the dashboard always has data; switch to live psutil
+collection by setting ``OSMON_LIVE=1``.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, List
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from .models import AgentStatus, Alert, BudgetConfig, SamplingTier
-from .monitor import MonitoringAgent
-from .telemetry import SamplingTier as TelemetryTier
+from .agent import MonitorAgent
+from .config import Config
+from .data_model import Tier
+from .models import AgentStatus, Alert, Baseline, ProcessInfo, RollbackActionModel
+from .scenarios import demo_scenario
 
 logger = logging.getLogger(__name__)
 
-# Global agent instance – simulation mode for demonstration
-agent = MonitoringAgent(simulation_mode=True, risk_threshold=4.0)
+
+# ---------------------------------------------------------------------------
+# Global agent
+# ---------------------------------------------------------------------------
+
+def _build_agent() -> MonitorAgent:
+    live = os.environ.get("OSMON_LIVE", "0") == "1"
+    return MonitorAgent(
+        config=Config(),
+        simulation=not live,
+        scenario=None if live else demo_scenario(),
+        model_overhead=not live,
+        tick_interval=0.5,
+    )
+
+
+agent = _build_agent()
 
 
 @asynccontextmanager
@@ -28,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="OS Monitoring Agent",
+    title="OS Behavior Monitor",
     description=(
         "Divergence-Gated Behavioral Baseline Learning with "
         "Overhead-Budgeted Adaptive Sampling"
@@ -45,105 +69,118 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+router = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 async def root() -> dict[str, str]:
     return {
-        "service": "OS Monitoring Agent",
+        "service": "OS Behavior Monitor",
         "version": "1.0.0",
         "status": "running" if agent.running else "stopped",
+        "docs": "/docs",
     }
 
 
-@app.get("/status", response_model=AgentStatus)
-async def get_status() -> AgentStatus:
-    """Get current agent status."""
-    return agent.get_status()
+@router.get("/status", response_model=AgentStatus)
+async def get_status() -> dict[str, Any]:
+    return agent.status()
 
 
-@app.get("/alerts", response_model=list[Alert])
+@router.get("/alerts", response_model=List[Alert])
 async def get_alerts(
     acknowledged: bool | None = None,
     severity: str | None = None,
     limit: int = Query(default=100, ge=1, le=1000),
-) -> list[Alert]:
-    """Get alerts, optionally filtered."""
-    alerts = agent.get_alerts(acknowledged=acknowledged, severity=severity)
-    return alerts[:limit]
+) -> List[dict[str, Any]]:
+    return agent.get_alerts(acknowledged=acknowledged, severity=severity, limit=limit)
 
 
-@app.post("/alerts/{alert_id}/acknowledge")
+@router.post("/alerts/{alert_id}/acknowledge")
 async def acknowledge_alert(alert_id: str) -> dict[str, bool]:
-    """Acknowledge an alert."""
-    success = agent.acknowledge_alert(alert_id)
-    if not success:
+    if not agent.acknowledge_alert(alert_id):
         raise HTTPException(status_code=404, detail="Alert not found")
-    return {"acknowledged": success}
+    return {"acknowledged": True}
 
 
-@app.get("/baselines")
-async def list_baselines() -> list[dict[str, Any]]:
-    """List all active baselines with their status."""
-    store = agent.baseline_store
-    return [entry.to_dict() for entry in store.all_entries()]
+@router.get("/baselines", response_model=List[Baseline])
+async def list_baselines() -> List[dict[str, Any]]:
+    return agent.get_baselines()
 
 
-@app.get("/baselines/pid/{pid}")
-async def get_baselines_for_pid(pid: int) -> list[dict[str, Any]]:
-    """Get baseline details for a specific PID."""
+@router.get("/baselines/pid/{pid}", response_model=List[Baseline])
+async def get_baselines_for_pid(pid: int) -> List[dict[str, Any]]:
     return agent.get_baseline_info(pid)
 
 
-@app.post("/baselines/pid/{pid}/reconcile")
-async def reconcile_baseline(
-    pid: int, corroborated: bool = False
-) -> dict[str, Any]:
-    """Request reconciliation of quarantined samples."""
+@router.post("/baselines/pid/{pid}/reconcile")
+async def reconcile_baseline(pid: int, corroborated: bool = False) -> dict[str, Any]:
     merged = agent.reconcile(pid, corroborated=corroborated)
     return {"merged": merged, "corroborated": corroborated}
 
 
-@app.get("/processes")
-async def list_processes() -> list[dict[str, Any]]:
-    """List all monitored processes with their sampling tiers."""
-    collector = agent.collector
-    sampler = agent.sampler
-    pids = collector.get_all_pids()
-    return [
-        {
-            "pid": pid,
-            "sampling_tier": sampler.get_tier(pid).value,
-            "sampling_interval_sec": sampler.get_tier_interval(pid),
-        }
-        for pid in pids
-    ]
+@router.post("/baselines/pid/{pid}/dismiss")
+async def dismiss_baseline(pid: int) -> dict[str, Any]:
+    dropped = agent.dismiss(pid)
+    return {"dismissed": dropped}
 
 
-@app.post("/processes/{pid}/tier")
+@router.get("/processes", response_model=List[ProcessInfo])
+async def list_processes() -> List[dict[str, Any]]:
+    return agent.get_processes()
+
+
+@router.post("/processes/{pid}/tier")
 async def set_process_tier(pid: int, tier: int) -> dict[str, Any]:
-    """Set sampling tier for a specific process."""
     try:
-        sampling_tier = SamplingTier(tier)
+        sampling_tier = Tier(tier)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid tier: {tier}")
-    granted = agent.set_sampling_tier(pid, sampling_tier)
-    return {"pid": pid, "granted_tier": granted, "requested_tier": sampling_tier}
+    granted = agent.set_process_tier(pid, sampling_tier)
+    return {"pid": pid, "granted_tier": int(granted), "tier_name": granted.name}
 
+
+@router.get("/budget")
+async def get_budget() -> dict[str, Any]:
+    return agent.budget_status()
+
+
+@router.get("/rollback-actions", response_model=List[RollbackActionModel])
+async def get_rollback_actions() -> List[dict[str, Any]]:
+    return [a.to_dict() for a in agent.response.get_rollback_actions()]
+
+
+@router.post("/rollback/{action_id}")
+async def rollback_action(action_id: str) -> dict[str, bool]:
+    ok = agent.response.rollback(action_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Action not found or already rolled back")
+    return {"rolled_back": ok}
+
+
+app.include_router(router)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket
+# ---------------------------------------------------------------------------
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    """WebSocket for real-time monitoring data."""
     await websocket.accept()
     try:
         while True:
-            status = agent.get_status()
             await websocket.send_json({
                 "type": "status",
                 "timestamp": datetime.utcnow().isoformat(),
-                "data": status.model_dump(mode="json"),
+                "data": agent.status(),
             })
             await asyncio.sleep(2)
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - defensive
         logger.exception("WebSocket error: %s", e)

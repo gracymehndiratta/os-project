@@ -1,125 +1,323 @@
 # Divergence-Gated Behavioral Baseline Learning with Overhead-Budgeted Adaptive Sampling
 
-An operating-system monitoring agent that learns per-process behavioral baselines and detects anomalies while managing its own resource consumption through adaptive sampling.
+An operating-system monitoring agent that learns per-(application, context) behavioral
+baselines, detects anomalous process behaviour with a joint multi-resource score, and
+manages its own resource consumption through an adaptive sampling controller.
+
+The prototype implements the design and implementation document
+(*OS Behavior Monitor*, Oct 2026). It is a **per-tick pipeline** with two feedback loops:
+
+- **Loop 1 — poisoning control (divergence gate).** The gate compares short-term,
+  long-term and trusted-reference baselines, freezes the long-term baseline on suspicious
+  drift, and holds new samples in a bounded quarantine buffer. Buffers are only merged
+  after *independent* corroboration.
+- **Loop 2 — overhead control (sampling controller).** A self-meter measures the agent's
+  own CPU/RSS and the controller adjusts a per-tick cost budget to stay near the CPU
+  target, assigning sampling tiers in priority order.
+- **Interlock.** A baseline freeze flags the process and raises its desired sampling tier;
+  a `THROTTLE` response escalates the tier through the response engine.
 
 ## Architecture
 
 ```
-Telemetry Collector → Context Builder → Baseline Store (EWM + CUSUM + Quarantine)
-                                                        ↓
-                                                  Anomaly Scorer (Mahalanobis)
-                                                        ↓
-                                              Risk Score + Feature Contributions
-                                                        ↓
-Response Controller ←→ Budgeted Sampler (budget-governed adaptive sampling)
+                       ┌──────────────────────────────────────────────┐
+                       │              MonitorAgent (agent.py)          │
+                       └──────────────────────────────────────────────┘
+ Collector ──► Feature Builder ──► Identity/Context ──► Baseline Store
+   ▲                                                        │
+   │ sampling tier                    Joint Scorer ──► Explainer ──► Response Engine
+   │                                                        │
+ Sampling Controller ◄── freeze request ◄── Divergence Gate ◄─► Quarantine Buffer
+   ▲                                                        │
+ Self-Meter (agent CPU / RSS)                     Corroboration sources
 ```
 
-## Components
+Per-tick data flow (design §4):
 
-| Module | Purpose |
-|--------|---------|
-| `agent/telemetry.py` | Process metrics collection (real psutil + simulation mode with attack patterns) |
-| `agent/context.py` | Context keys (time bucket, session, parent) + ProcessIdentity (PID reuse safe) |
-| `agent/baseline.py` | EWM baselines with CUSUM drift detection, quarantine buffer, and reconcile lifecycle |
-| `agent/scorer.py` | Mahalanobis distance scorer with ranked per-feature contributions |
-| `agent/sampler.py` | Budget-governed adaptive sampling with progressive degradation |
-| `agent/response_controller.py` | Graduated response (log → notify → sampling escalation → suspend) with rollback |
-| `agent/monitor.py` | Main orchestrator – runs the collection/processing loop |
-| `agent/api.py` | FastAPI REST + WebSocket interface |
-| `agent/models.py` | Pydantic models for API serialization |
+1. the controller assigns a sampling tier to every process, in priority order, within budget;
+2. the collector returns samples for processes due at that tier (tier 0 returns CPU + memory only);
+3. each full sample becomes a log-scale feature vector, keyed by application identity and context;
+4. the store picks the context-specific baseline if trusted, otherwise the coarse `*` baseline;
+5. the scorer computes the joint deviation `D²` and a risk value;
+6. the gate updates its drift measures and decides to learn / freeze / merge / discard;
+7. alerts fire after several consecutive high-risk samples, carrying ranked contributions;
+8. the self-meter reads the agent's own usage and the controller adjusts the budget.
 
-## Quick Start
+During warm-up (`baseline.min_samples`) every sample is used for learning and nothing is
+scored, so new baselines are not judged on a handful of samples.
+
+## Module map
+
+| Module | Responsibility | Claim step |
+|--------|----------------|-----------|
+| `agent/collector.py` | `ReplayCollector` (synthetic traces) and `PsutilCollector` (live sampling) | (a) telemetry |
+| `agent/features.py` | Log-scale feature vector, stable application identity, time/parent context | (b)(c) |
+| `agent/baseline.py` | `Gaussian` (incremental mean/cov + exact merge), `KeyState`, `BaselineStore` with coarse fallback + LRU | (b) baselines |
+| `agent/scoring.py` | Regularized joint Mahalanobis `D²` + ranked per-feature contributions | (c)(g) |
+| `agent/gate.py` | Mean-shift, CUSUM, reference drift; `NORMAL→FROZEN→MERGE/DISCARD`; quarantine; corroboration | (d)(e) |
+| `agent/sampling.py` | `SelfMeter` (own usage) and `SamplingController` (tier assignment, budget hysteresis, reduced coverage) | (f)(g) |
+| `agent/response.py` | Graduated responses (notify → throttle → suspend), dry-run by default, rollback | (g) |
+| `agent/agent.py` | Wires the pipeline and runs the loops; interlocks | all |
+| `agent/config.py` | All tunables from design §8 in one place | — |
+| `agent/data_model.py` | `Sample`, `BaselineKey`, `Tier`, `GateState`, `RiskLevel`, `Alert`, … | — |
+| `agent/scenarios.py` | Synthetic traces for the five experiment scenarios + live demo | §9 |
+| `agent/evaluation.py` | Variants, scenario runner and metrics table | §9/§10 |
+| `agent/api.py` | FastAPI REST under `/api` + WebSocket `/ws` | — |
+| `agent/models.py` | Pydantic response models for the API boundary | — |
+| `simulator.py` | Standalone demo / replay / live runner | — |
+| `evaluate.py` | CLI for the evaluation harness | §9 |
+
+## Quick start
+
+### Backend
 
 ```bash
 cd backend
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Start the API server (includes the monitoring agent in simulation mode)
-python main.py
-# Or: uvicorn agent.api:app --host 0.0.0.0 --port 8000
+# API server + dashboard backend (agent runs in simulation mode by default)
+python main.py                     # http://localhost:8000  (docs at /docs)
+# or: uvicorn agent.api:app --port 8000
 
-# Run the standalone simulator (in another terminal)
-python simulator.py --mode normal --duration 60
-python simulator.py --mode attack --duration 120
+# Live psutil collection instead of replay:
+OSMON_LIVE=1 python main.py
+
+# Standalone simulator
+python simulator.py --scenario demo --ticks 600
+python simulator.py --scenario slow_ramp --variant full --ticks 3000
+python simulator.py --live --ticks 60
+
+# Evaluation harness (design §9/§10)
+python evaluate.py --quick
+python evaluate.py --scenarios slow_ramp evading_ramp --variants full plain_adaptive
 ```
 
-## API Endpoints
+### Frontend dashboard
+
+```bash
+cd frontend
+npm install
+npm run dev        # http://localhost:3000, proxies /api and /ws to :8000
+npm run build      # production build into dist/
+```
+
+### Tests
+
+There is no `pytest` dependency; use the standard library runner from `backend/`:
+
+```bash
+cd backend
+python -m unittest discover -s tests
+```
+
+## Configuration
+
+All parameters live in `agent/config.py` (design §8). The defaults below are **starting
+points** — the design document says to choose final values from experiments, and
+`evaluate.py` is the harness used to re-tune them.
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `baseline.alpha_short` / `alpha_long` | `0.1` / `0.01` | EWMA rates of the two baselines |
+| `baseline.min_samples` | `30` | Samples before a baseline is trusted |
+| `baseline.ridge` | `0.02` | Covariance regularization (min tolerance in log units) |
+| `baseline.max_entries` | `256` | LRU cap on stored (application, context) keys |
+| `gate.shift_thr` | `1.5` | Short-vs-long standardized shift that triggers a freeze |
+| `gate.cusum_k` / `cusum_h` | `0.5` / `12.0` | CUSUM allowance and alarm level |
+| `gate.ref_thr` | `1.0` | Long-vs-reference shift that triggers a freeze |
+| `gate.update_guard` | `3.0` | Per-sample score above which the long baseline does not learn |
+| `gate.ttl_days` | `1.0` | Lifetime of an uncorroborated quarantine buffer |
+| `gate.max_buffers` / `max_buffer_samples` | `64` / `512` | Buffer caps |
+| `score.notify` / `throttle` / `suspend` | `0.995` / `0.9995` / `0.99995` | Chi-squared risk percentiles for response levels |
+| `score.alert_consecutive` | `3` | Consecutive high-risk samples before an alert fires |
+| `sampling.cpu_budget_pct` | `1.0` | Target agent CPU use (percent of one core) |
+| `sampling.window_ticks` | `20` | Self-meter measurement window |
+| `sampling.budget_shrink` / `budget_grow` | `0.20` / `0.15` | Budget change per over/under window |
+| `sampling.grow_threshold` / `dwell_count` | `0.70` / `3` | Grow only after several under-target windows (hysteresis) |
+| `dry_run` | `True` | Disruptive responses are logged, not executed |
+
+**Tuned in practice.** Two knobs were adjusted from the design defaults after experiments
+(design §8 says to tune): the diurnal amplitude in `scenarios._diurnal` is `0.08`, and the
+gate's standardization ridge `_GATE_RIDGE` is `1e-3`. The gate's reference snapshot is
+taken once the long baseline has converged (`2 * min_samples`), and drift measures are
+standardized by the **trusted reference** covariance so a slow ramp cannot hide by
+inflating the live long baseline's own variance.
+
+## Features
+
+Five canonical features (design §7): `cpu_pct`, `rss_mb`, `disk_io_kbps`, `net_kbps`,
+`child_rate`. Live `psutil` collection has no per-process network byte counter, so the
+live collector uses the **open-socket count as a proxy**; real byte counts need eBPF/ETW
+(out of scope).
+
+## Sampling tiers
+
+| Tier | Interval | Features | Cost / tick |
+|------|----------|----------|-------------|
+| 0 — MINIMAL | every 8 ticks | CPU + memory only | 0.125 units |
+| 1 — NORMAL | every 2 ticks | all five | 2 units |
+| 2 — DETAILED | every tick | all five | 4 units |
+
+When the budget is tight, processes are served in priority order: flagged and high-risk
+processes first. Every process keeps at least tier 0, and each tick where a process
+receives less than it wanted is counted as **reduced coverage**.
+
+## Gate state machine
+
+```
+LEARNING ──(min_samples)──► NORMAL ──(mean shift | CUSUM | reference drift)──► FROZEN
+                              ▲                                                  │
+                              │                    independent corroboration ──► MERGE
+                              │                    TTL expired ───────────────► DISCARD
+                              └──────────────────────────────────────────────────┘
+```
+
+- **NORMAL** — short baseline always learns; long baseline learns only when the sample
+  score is under the update guard.
+- **FROZEN** — long baseline locked; samples go to quarantine; the key is flagged.
+- **MERGE** — buffer summary merged into the long baseline; reference reset; CUSUM cleared.
+- **DISCARD** — buffer dropped; short baseline reset to long; the gate may freeze again if
+  the behaviour continues.
+
+A return to normal behaviour is **never** treated as corroboration (malware can stop on
+purpose). Corroboration comes only from independent sources: an administrator confirmation
+or a verified application update.
+
+## API endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Service info |
-| `/status` | GET | Agent status (tier, budgets, violations) |
-| `/alerts` | GET | List alerts (filter by `acknowledged`, `severity`) |
-| `/alerts/{id}/acknowledge` | POST | Acknowledge an alert |
-| `/baselines` | GET | List all active baselines |
-| `/baselines/pid/{pid}` | GET | Baseline details for a process |
-| `/baselines/pid/{pid}/reconcile` | POST | Merge quarantined samples (requires `corroborated=true`) |
-| `/processes` | GET | List monitored processes with sampling tiers |
-| `/processes/{pid}/tier?tier=N` | POST | Set sampling tier for a process |
-| `/ws` | WebSocket | Real-time status stream (2s updates) |
+| `/api/status` | GET | Agent status (tick, tier, budgets, violations) |
+| `/api/alerts` | GET | List alerts (`acknowledged`, `severity`, `limit`) |
+| `/api/alerts/{id}/acknowledge` | POST | Acknowledge an alert |
+| `/api/baselines` | GET | List all active baselines |
+| `/api/baselines/pid/{pid}` | GET | Baselines for a process |
+| `/api/baselines/pid/{pid}/reconcile` | POST | Merge quarantine on corroboration (`corroborated=true`) |
+| `/api/baselines/pid/{pid}/dismiss` | POST | Discard quarantine (TTL-style) |
+| `/api/processes` | GET | Monitored processes with risk + sampling tier |
+| `/api/processes/{pid}/tier` | POST | Set sampling tier for a process |
+| `/api/budget` | GET | Sampling budget status |
+| `/api/rollback-actions` | GET | Recorded reversible actions |
+| `/api/rollback/{action_id}` | POST | Roll back a recorded action |
+| `/ws` | WebSocket | Real-time status stream (2 s updates) |
 
-## Simulation Mode
+## Experiment plan and metrics
 
-The telemetry collector includes a simulation mode with pre-configured processes:
+Variants (design §9): `static`, `plain_adaptive`, `gate_only`, `budget_only`, `full`.
+`gate_only` and `budget_only` are the ablations that show each controller contributes.
 
-- **Normal processes**: chrome, vscode, python3, node, postgres, nginx
-- **Attack simulations**:
-  - `malware_sim` – Boiling frog (gradual CPU ramp)
-  - `exploit_py` – Spike attack (sudden CPU+IO burst)
-  - `leaky_app` – Memory leak (continuous growth)
-  - `bash_fork` – Child bomb (rapid process spawning)
+Scenarios (design §9):
 
-## Baseline Lifecycle
+| Scenario | Simulates | Main measurements |
+|----------|-----------|-------------------|
+| `benign` | days of normal diurnal behaviour | false-positive episodes per process-day |
+| `slow_ramp` | gradual multi-resource ramp over days | detection rate and delay |
+| `evading_ramp` | ramp slow enough to stay under the short-vs-long gate | whether reference drift still catches it |
+| `legit_step` | permanent benign step + administrator confirmation | alerts after the step, recovery time |
+| `overhead` | many simulated processes under a CPU budget | modeled CPU, budget violations, reduced coverage |
 
-```
-LEARNING → NORMAL → FROZEN → RECONCILED
-              ↑         ↓
-              └─────────┘ (quarantine dismissed)
-```
+Metrics reported by `format_results`: detection rate and delay (simulated days),
+false-positive episodes per process per day, alerts remaining after a legitimate step and
+the time until they stop, agent CPU, budget violations, reduced-coverage ticks and
+p50/p95/p99 per-sample latency (design §10). Latency is wall-clock and machine-dependent,
+so it is omitted from the fixed reference table below; `agent.status()` exposes it as
+`latency_p50_ms` / `latency_p95_ms` / `latency_p99_ms` for live runs.
 
-1. **LEARNING**: Accumulating initial observations (30 samples required)
-2. **NORMAL**: Updating both short-term and long-term EWM baselines
-3. **FROZEN**: Long-term baseline locked; samples go to quarantine buffer
-4. **RECONCILED**: Quarantine merged after admin corroboration
+### Reference results (`python evaluate.py --quick`)
 
-## Sampling Tiers
+| scenario | variant | det | delay(d) | atk_alerts | FP/proc/day | freezes | cpu% | reduced | after | recov(d) |
+|----------|---------|-----|----------|-----------|-------------|---------|------|---------|-------|----------|
+| benign | static | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
+| benign | plain_adaptive | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
+| benign | gate_only | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
+| benign | budget_only | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
+| benign | full | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
+| slow_ramp | static | yes | 0.94 | 235 | 0.0000 | 0 | 0.03 | 0 | – | – |
+| slow_ramp | **plain_adaptive** | **no** | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
+| slow_ramp | **gate_only** | **yes** | 0.94 | 351 | 0.0000 | 5 | 0.04 | 0 | – | – |
+| slow_ramp | **budget_only** | **no** | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
+| slow_ramp | **full** | **yes** | 0.94 | 355 | 0.0000 | 5 | 0.04 | 0 | – | – |
+| evading_ramp | static | yes | 1.12 | 282 | 0.0000 | 0 | 0.03 | 0 | – | – |
+| evading_ramp | plain_adaptive | no | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
+| evading_ramp | gate_only | yes | 1.94 | 360 | 0.0000 | 8 | 0.04 | 0 | – | – |
+| evading_ramp | budget_only | no | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
+| evading_ramp | full | yes | 1.94 | 358 | 0.0000 | 8 | 0.04 | 0 | – | – |
+| legit_step | static | – | – | 0 | – | 0 | 0.03 | 0 | 240 | 0.50 |
+| legit_step | plain_adaptive | – | – | 0 | – | 0 | 0.03 | 0 | 4 | 0.02 |
+| legit_step | gate_only | – | – | 0 | – | 5 | 0.03 | 0 | 360 | 0.27 |
+| legit_step | budget_only | – | – | 0 | – | 0 | 0.03 | 0 | 4 | 0.02 |
+| legit_step | full | – | – | 0 | – | 5 | 0.03 | 0 | 360 | 0.27 |
+| overhead | budget_only | – | – | 0 | 0.0000 | 0 | 0.23 | 15 | – | – |
+| overhead | full | – | – | 0 | 0.0000 | 0 | 0.23 | 15 | – | – |
 
-| Tier | Interval | Use Case |
-|------|----------|----------|
-| MINIMAL | 5s | Background / trusted processes |
-| LOW | 3s | Default tier |
-| MEDIUM | 1s | Elevated risk |
-| HIGH | 0.5s | Frozen baseline / high risk |
+What this shows:
 
-## Budget Configuration
+- **No false positives** on the benign scenario for any variant (0 episodes per process-day).
+- The gate ablations (`gate_only`, `full`) **detect both ramps** where `plain_adaptive` and
+  `budget_only` miss them; the evading ramp is caught by reference drift at ~1.94 days.
+- On `legit_step`, `plain_adaptive` absorbs the benign step almost immediately
+  (~0.02 days) — but that same fast adaptation is exactly why it misses the slow ramps. The
+  gate variants freeze on the step and only recover once the administrator corroborates
+  (~0.27 days after confirmation), which is the honest tradeoff of design §11.3.
+- The budget controller is active under load (`overhead`): it reduces coverage for 15 ticks
+  and keeps modeled CPU near 0.23%.
 
-The `BudgetConfig` model controls the agent's own resource limits:
+Numbers are from the fast `--quick` run and are deterministic; `python evaluate.py` runs
+the longer configuration. These are synthetic-trace results only (design §11).
 
-```python
-BudgetConfig(
-    cpu_percent_max=5.0,
-    memory_mib_max=256.0,
-    io_bytes_per_sec_max=1_000_000.0,
-    measurement_window_sec=30,
-    include_kernel_overhead=True,
-)
-```
+## Simulation mode
 
-When the agent exceeds its budget, it progressively degrades:
-`HIGH → MEDIUM → LOW → MINIMAL`
+The replay collector ships with pre-configured benign processes (chrome, vscode, python3,
+node, postgres, nginx) and, for the live demo, four attack patterns:
 
-## Key Design Decisions
+- `malware_sim` — slow multi-resource ramp (boiling frog)
+- `exploit_py` — sudden CPU + I/O burst (spike)
+- `leaky_app` — continuous memory growth (leak)
+- `bash_fork` — rapid child-process spawning (fork bomb)
 
-1. **Divergence gating with quarantine**: When CUSUM detects persistent drift, the long-term baseline is frozen and observations enter a bounded quarantine buffer. Samples are only merged after independent corroboration.
+## Claim-to-code map (design §13)
 
-2. **CUSUM for slow poisoning**: An accumulated-drift detector catches persistent small changes that stay below the instantaneous divergence threshold.
+| Draft claim step | Implemented in | Proved by |
+|------------------|----------------|-----------|
+| Collect multi-resource telemetry | `collector`, `features` | `TestReplayCollector`, `TestPsutilCollector`; replay runs |
+| Context vector and context-specific baseline | `features`, `baseline` | `TestStore`; `benign` scenario false positives |
+| Joint deviation score with correlations | `scoring.mahalanobis` | `TestScorer` |
+| Divergence between short and long baselines, freeze | `gate` (`mean_shift`, `reference_drift`, CUSUM, state machine) | `TestGate`; `slow_ramp`, `evading_ramp` |
+| Quarantine buffer and reconcile on independent corroboration | `gate` + `baseline.QuarantineBuffer` | `TestGate.test_corroboration_*`; `legit_step` |
+| Own-overhead measurement and budgeted sampling | `sampling` (`SelfMeter`, `SamplingController`, `LatencyTracker`) | `TestSelfMeter`, `TestSamplingController`, `TestLatency`; `overhead` |
+| Freeze raises sampling priority | `agent._priorities`, `agent._on_throttle` | `TestInterlock` |
+| Ranked alert and graduated response | `scoring.explain`, `response` | `TestResponseEngine` |
 
-3. **Interlock**: A baseline freeze triggers a sampling-tier increase for the affected process — subject to budget availability.
+## Design decisions
 
-4. **Joint multi-resource scoring**: Mahalanobis distance with per-feature variance prevents double-counting correlated features and detects combinations of moderate deviations.
+1. **Divergence gating with quarantine** — when drift is detected the long-term baseline is
+   frozen and observations enter a bounded quarantine buffer, merged only after
+   independent corroboration.
+2. **CUSUM for slow poisoning** — an accumulated-drift detector catches persistent small
+   changes that stay below the instantaneous threshold.
+3. **Reference drift** — a trusted snapshot catches an attacker who moves both short and
+   long baselines together.
+4. **Interlock** — a freeze (and a `THROTTLE` response) raises the affected process's
+   sampling tier, subject to budget availability.
+5. **Joint multi-resource scoring** — Mahalanobis distance with per-feature variance
+   prevents double-counting correlated features and detects combinations of moderate
+   deviations.
+6. **Explainable alerts** — each alert lists the top feature contributions with z-scores
+   and direction.
+7. **Graduated response** — actions escalate from logging to notification to sampling
+   escalation to suspension, all recorded for rollback, in dry-run mode by default.
 
-5. **Explainable alerts**: Each alert lists the top feature contributions with z-scores and direction.
+## Honest limitations (design §11)
 
-6. **Graduated response**: Actions escalate from logging to process suspension, with all disruptive actions recorded for rollback.
+- Attack traces are **synthetic**; no claim is made about performance on real attacks.
+- Divergence gating **reduces but does not eliminate** slow-poisoning risk; reference drift
+  narrows the gap but also freezes on legitimate slow change, which then needs
+  administrator confirmation.
+- Requiring independent corroboration means most buffers are discarded, so baselines can go
+  stale after real workload changes and raise false positives (measured by `legit_step`).
+- Load can push the monitor into degraded sampling; reduced coverage is counted and should
+  be treated as a risk signal.
+- A Python prototype **overstates overhead** because of interpreter cost.
+- Automated suspension can disrupt legitimate processes; responses stay in dry-run mode
+  unless explicitly enabled.
