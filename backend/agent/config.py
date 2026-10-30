@@ -118,12 +118,29 @@ class SamplingConfig:
 
 
 @dataclass
+class IsolationConfig:
+    """Isolation-forest ablation parameters (Review 1 prior work [6]).
+
+    The isolation forest is *not* part of the proposed solution; it is the
+    conventional point-anomaly detector used as an ablation.  These knobs
+    keep it fully online by refitting on a sliding window per key, which is
+    the "modification for incremental learning" the literature notes [6].
+    """
+    n_estimators: int = 100        # Trees per forest
+    max_samples: int = 256         # Sliding-window size (and subsample cap)
+    refit_every: int = 120         # Ticks between refits
+    min_fit: int = 128             # Samples before the first fit (tail calibration)
+    random_state: int = 0          # Deterministic forests
+
+
+@dataclass
 class Config:
     """Top-level configuration aggregating all sub-configs."""
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
     gate: GateConfig = field(default_factory=GateConfig)
     score: ScoreConfig = field(default_factory=ScoreConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    isolation: IsolationConfig = field(default_factory=IsolationConfig)
     dry_run: bool = True          # All disruptive responses are logged, not executed
     warm_up_ticks: int = 0        # Extra ticks of learning-only (beyond min_samples)
     ticks_per_day: int = 1440     # Replay ticks that represent one simulated day

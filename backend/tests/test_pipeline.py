@@ -6,16 +6,18 @@ and the end-to-end agent behaviour.
 """
 from __future__ import annotations
 
+import threading
 import unittest
 
 import numpy as np
 
 from agent.agent import MonitorAgent
 from agent.baseline import BaselineStore, Gaussian, KeyState
-from agent.config import Config, N_FEATURES
+from agent.config import Config, FEATURE_NAMES, N_FEATURES
 from agent.data_model import BaselineKey, GateState, RiskLevel, Tier
 from agent.evaluation import evaluate
 from agent.gate import CorroborationSource, DivergenceGate, is_independent, mean_shift
+from agent.isolation import IsolationScorer
 from agent.scenarios import benign_scenario, demo_scenario, slow_ramp_scenario
 from agent.scoring import Scorer
 from agent.sampling import LatencyTracker
@@ -82,6 +84,28 @@ class TestStore(unittest.TestCase):
         for i in range(10):
             store.get_or_create(BaselineKey(f"app{i}", "*"))
         self.assertLessEqual(len(store.all_states()), 4)
+
+    def test_snapshot_is_safe_during_mutation(self):
+        """Readers must not crash while the monitoring loop mutates the store."""
+        store = BaselineStore(Config())
+        errors: list = []
+
+        def writer() -> None:
+            try:
+                for i in range(5000):
+                    store.get_or_create(BaselineKey(f"app{i % 64}", "*"))
+            except Exception as exc:  # pragma: no cover - regression guard
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        for _ in range(5000):
+            store.all_states()
+            store.frozen_states()
+            store.quarantine_count()
+        thread.join(timeout=10.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
 
 
 class TestScorer(unittest.TestCase):
@@ -237,6 +261,111 @@ class TestAgentBehaviour(unittest.TestCase):
             "memory_budget_max", "io_budget_max",
         ):
             self.assertIn(field, status)
+
+
+class TestIsolationScorer(unittest.TestCase):
+    """The isolation-forest ablation (Review 1 §6 prior work)."""
+
+    def _scorer(self):
+        cfg = Config()
+        cfg.isolation.n_estimators = 60
+        cfg.isolation.max_samples = 256
+        cfg.isolation.min_fit = 128
+        cfg.isolation.refit_every = 10_000
+        iso = IsolationScorer(cfg)
+        key = BaselineKey("app-iforest", "*")
+        rng = _rng(7)
+        for i in range(300):
+            iso.observe(key, rng.normal(0.0, 0.05, N_FEATURES), tick=i)
+        return iso, key
+
+    def test_no_score_before_min_fit(self):
+        cfg = Config()
+        cfg.isolation.n_estimators = 20
+        cfg.isolation.refit_every = 10_000
+        iso = IsolationScorer(cfg)
+        key = BaselineKey("cold", "*")
+        rng = _rng(1)
+        for i in range(10):
+            iso.observe(key, rng.normal(0.0, 0.05, N_FEATURES), tick=i)
+        self.assertIsNone(iso.score(key, np.zeros(N_FEATURES), tick=10))
+        self.assertEqual(iso.fitted_count(), 0)
+
+    def test_outlier_scores_higher_than_in_distribution(self):
+        iso, key = self._scorer()
+        normal = iso.score(key, np.zeros(N_FEATURES), tick=100)
+        outlier = iso.score(key, np.full(N_FEATURES, 2.0), tick=101)
+        self.assertIsNotNone(normal)
+        self.assertIsNotNone(outlier)
+        self.assertGreater(outlier.risk, normal.risk)
+        self.assertGreater(outlier.d_squared, normal.d_squared)
+        self.assertGreaterEqual(outlier.risk, 0.0)
+        self.assertLessEqual(outlier.risk, 1.0)
+
+    def test_single_axis_shift_is_not_detected(self):
+        """Documented limitation: iForest misses one-feature deviations."""
+        iso, key = self._scorer()
+        x = np.zeros(N_FEATURES)
+        x[2] = 3.0
+        score = iso.score(key, x, tick=102)
+        self.assertIsNotNone(score)
+        self.assertEqual(score.level, RiskLevel.NORMAL)
+
+    def test_contributions_rank_and_sum(self):
+        iso, key = self._scorer()
+        x = np.full(N_FEATURES, 1.0)
+        x[2] = 3.0
+        score = iso.score(key, x, tick=103)
+        self.assertIsNotNone(score)
+        self.assertEqual(len(score.contributions), N_FEATURES)
+        self.assertAlmostEqual(
+            sum(abs(c.contribution_pct) for c in score.contributions), 1.0, places=6
+        )
+        self.assertEqual(score.contributions[0].name, FEATURE_NAMES[2])
+
+    def test_agent_runs_with_iforest_detector(self):
+        cfg = Config()
+        cfg.isolation.n_estimators = 20
+        cfg.isolation.refit_every = 200
+        agent = MonitorAgent(
+            config=cfg, scenario=benign_scenario(700), detector="iforest"
+        )
+        agent.run(700)
+        self.assertEqual(agent.tick, 700)
+        self.assertIsNotNone(agent.isolation)
+        self.assertGreater(agent.isolation.fitted_count(), 0)
+
+
+class TestEvaluationHarness(unittest.TestCase):
+    def test_scenario_is_rebuilt_for_each_variant(self):
+        """Every variant must see an identical (fresh) noise stream."""
+        import agent.evaluation as ev
+
+        calls = []
+        real = ev._scenario_builders
+
+        def spy(quick):
+            builders = real(quick)
+
+            def wrap(name):
+                def build():
+                    calls.append(name)
+                    return builders[name]()
+
+                return build
+
+            return {k: wrap(k) for k in builders}
+
+        ev._scenario_builders = spy
+        try:
+            ev.run_all(
+                variants=["static", "plain_adaptive"],
+                scenarios=["benign"],
+                quick=True,
+            )
+        finally:
+            ev._scenario_builders = real
+        self.assertEqual(calls, ["benign", "benign"])
 
 
 if __name__ == "__main__":

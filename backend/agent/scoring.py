@@ -33,6 +33,15 @@ def _risk_level(risk: float, config: Config) -> RiskLevel:
     return RiskLevel.NORMAL
 
 
+def risk_level(risk: float, config: Config) -> RiskLevel:
+    """Public alias for the risk-threshold mapping.
+
+    Shared with the isolation-forest ablation so both detectors use exactly
+    the same response thresholds.
+    """
+    return _risk_level(risk, config)
+
+
 class Scorer:
     """Regularized Mahalanobis scorer with ranked feature contributions."""
 
@@ -103,6 +112,10 @@ class Scorer:
             )
         out.sort(key=lambda c: abs(c.contribution_pct), reverse=True)
         return out
+
+    def neutral(self, state: KeyState, x: np.ndarray) -> ScoreResult:
+        """No-opinion score returned before a detector has enough history."""
+        return self._neutral(state, x)
 
     def _neutral(self, state: KeyState, x: np.ndarray) -> ScoreResult:
         std = state.long.std()

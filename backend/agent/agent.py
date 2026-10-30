@@ -42,6 +42,7 @@ from .data_model import (
 )
 from .features import baseline_key, to_feature_vector
 from .gate import CorroborationSource, DivergenceGate
+from .isolation import IsolationScorer
 from .sampling import LatencyTracker, SamplingController, SelfMeter
 from .scenarios import Scenario, demo_scenario
 from .scoring import Scorer
@@ -67,11 +68,13 @@ class MonitorAgent:
         learning: str = "adaptive",          # "adaptive" | "static"
         model_overhead: bool = False,
         tick_interval: float = 0.5,
+        detector: str = "gaussian",          # "gaussian" | "iforest" (ablation)
     ) -> None:
         self.config = config or Config()
         self.enable_gate = enable_gate
         self.enable_budget = enable_budget
         self.learning = learning
+        self.detector = detector
         self.model_overhead = model_overhead
         self.tick_interval = tick_interval
         self.scenario = scenario or demo_scenario()
@@ -86,6 +89,10 @@ class MonitorAgent:
         self.store = BaselineStore(self.config)
         self.gate = DivergenceGate(self.config)
         self.scorer = Scorer(self.config)
+        # The isolation forest is an ablation detector, not the default.
+        self.isolation = (
+            IsolationScorer(self.config) if detector == "iforest" else None
+        )
         self.meter = SelfMeter(
             window_ticks=self.config.sampling.window_ticks, config=self.config
         )
@@ -213,6 +220,11 @@ class MonitorAgent:
         self._instance_state[sample.process_instance_id] = state
         x = to_feature_vector(sample.raw_features)
 
+        # The ablation detector observes every full sample, including the
+        # warm-up ones, so its window is ready when scoring begins.
+        if self.isolation is not None:
+            self.isolation.observe(key, x, tick)
+
         # Keep the coarse application baseline warm as a fallback (design §4,
         # step 4: use the context baseline if trusted, else the coarse one).
         coarse_key = key.coarse()
@@ -234,6 +246,15 @@ class MonitorAgent:
             return
 
         score = self.scorer.score(state, x, tick)
+        if self.isolation is not None:
+            iso_score = self.isolation.score(key, x, tick)
+            # The ablation is pure: until its forest is fitted it has no
+            # opinion, and it must not borrow the Gaussian detector's score.
+            score = (
+                iso_score
+                if iso_score is not None
+                else self.scorer.neutral(state, x)
+            )
 
         if self.enable_gate:
             self.gate.observe(state, score, x, tick)

@@ -1,0 +1,314 @@
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>OS Behavior Monitor — Implementation Report</title>
+<style>@page { size: A4; margin: 18mm 16mm; }
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: #1a202c; line-height: 1.5; font-size: 11pt; margin: 0;
+  padding: 0 6mm;
+}
+h1 { font-size: 26pt; margin: 0 0 4pt 0; color: #0b3d91; }
+h2 { font-size: 17pt; color: #0b3d91; border-bottom: 2px solid #0b3d91;
+     padding-bottom: 3pt; margin-top: 22pt; page-break-before: always; }
+h2:first-of-type { page-break-before: avoid; }
+h3 { font-size: 13pt; color: #14417a; margin-top: 16pt; }
+h4 { font-size: 11.5pt; color: #14417a; }
+p { margin: 6pt 0; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.5pt;
+       background: #f2f4f7; padding: 1px 4px; border-radius: 3px; }
+pre { background: #f2f4f7; border: 1px solid #e2e8f0; border-radius: 6px;
+      padding: 10px 12px; overflow-x: auto; page-break-inside: avoid; }
+pre code { background: none; padding: 0; font-size: 8.8pt; line-height: 1.35; }
+table { border-collapse: collapse; width: 100%; margin: 8pt 0;
+        page-break-inside: avoid; font-size: 9.5pt; }
+th, td { border: 1px solid #cbd5e0; padding: 4px 6px; text-align: left;
+         vertical-align: top; }
+th { background: #edf2f7; font-weight: 600; }
+img { max-width: 100%; height: auto; display: block; margin: 8pt auto;
+      border: 1px solid #e2e8f0; border-radius: 6px; }
+figure { margin: 10pt 0; text-align: center; }
+figcaption { font-size: 9pt; color: #4a5568; font-style: italic; margin-top: 3pt; }
+hr { border: none; border-top: 1px solid #cbd5e0; margin: 14pt 0; }
+ul, ol { margin: 6pt 0 6pt 0; padding-left: 22pt; }
+li { margin: 3pt 0; }
+.cover { text-align: center; margin-top: 30mm; }
+.cover h1 { font-size: 30pt; }
+.cover .sub { font-size: 14pt; color: #2d3748; margin-bottom: 26pt; }</style></head><body>
+<h1>OS Behavior Monitor</h1>
+<h2>Divergence-Gated Behavioral Baseline Learning with Overhead-Budgeted Adaptive Sampling</h2>
+<p><strong>Project Implementation Report — Review 2 / Review 3</strong></p>
+<table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><strong>Course</strong></td><td>Operating Systems</td></tr><tr><td><strong>Team members</strong></td><td>Gracy Mehndiratta (24BCE2987), Manan Kulshrestha (24BCE0262)</td></tr><tr><td><strong>Roll numbers</strong></td><td>24BCE2987, 24BCE0262</td></tr><tr><td><strong>Repository</strong></td><td>https://github.com/gracymehndiratta/os-project</td></tr><tr><td><strong>Date</strong></td><td>October 2026</td></tr><tr><td><strong>Document version</strong></td><td>1.0</td></tr></tbody></table>
+<hr>
+<h2>Table of Contents</h2>
+<ol><li>Introduction and Objectives</li><li>Technology Stack</li><li>System Architecture</li><li>Implementation Details</li><li>Configuration Details</li><li>Algorithms</li><li>Testing</li><li>Evaluation Results</li><li>Output Screenshots</li><li>How to Run</li><li>Claim-to-Code Map</li><li>Limitations</li><li>Repository and Access</li></ol>
+<hr>
+<h2>1. Introduction and Objectives</h2>
+<p>The <strong>OS Behavior Monitor</strong> is a Python monitoring agent that learns what &quot;normal&quot; behaviour looks like for each application on a machine and raises an explainable alert when a process deviates from that learned behaviour. The project is a research prototype built to produce measured evidence for two interlocking feedback loops:</p>
+<ul><li><strong>Loop 1 — the divergence gate (poisoning control).</strong> An attacker can try to &quot;poison&quot; a</li></ul>
+<p>behavioural baseline by changing a process&#x27;s behaviour *slowly*, so that the baseline learns the malicious behaviour and never raises an alert (a &quot;boiling frog&quot; / slow-ramp attack). The gate compares three baselines — short-term, long-term and a trusted reference snapshot — and <strong>freezes</strong> the long-term baseline when it detects suspicious drift. New samples are held in a bounded <strong>quarantine buffer</strong> and are only merged back after <strong>independent corroboration</strong> (an administrator confirmation or a verified application update). A return to normal behaviour is never treated as corroboration, because malware can stop on purpose.</p>
+<ul><li><strong>Loop 2 — the sampling controller (overhead control).</strong> A monitor that measures</li></ul>
+<p>everything all the time is itself a resource hog. A <strong>self-meter</strong> measures the agent&#x27;s own CPU and memory, and a controller adjusts a per-tick <strong>cost budget</strong> to stay near a configured CPU target. Sampling is organised into three tiers of increasing cost, and processes are served in priority order within the budget.</p>
+<ul><li><strong>Interlock.</strong> A baseline freeze marks the process as flagged and raises its desired</li></ul>
+<p>sampling tier, so suspicious processes are observed more closely — subject to the budget.</p>
+<h3>Objectives</h3>
+<ol><li>Learn per-<strong>(application, context)</strong> behavioural baselines that survive PID reuse.</li><li>Detect anomalies with a <strong>joint multi-resource</strong> score that accounts for correlations</li></ol>
+<p>between resources.</p>
+<ol><li>Protect baselines from <strong>slow poisoning</strong> using a divergence gate with quarantine and</li></ol>
+<p>corroboration.</p>
+<ol><li>Keep the agent&#x27;s <strong>own overhead</strong> inside a target budget using adaptive sampling.</li><li>Produce <strong>explainable alerts</strong> (ranked feature contributions) and **graduated</li></ol>
+<p>responses** in dry-run mode.</p>
+<ol><li>Provide a <strong>replay simulator and evaluation harness</strong> that compares the full system</li></ol>
+<p>against ablations on synthetic attack scenarios.</p>
+<h3>Scope</h3>
+<p>In scope: per-application, context-keyed baselines; joint multi-resource scoring; a divergence gate with quarantine and reconcile; overhead-budgeted sampling; explainable alerts; graduated responses in dry-run mode; a replay simulator and an evaluation harness.</p>
+<p>Out of scope: kernel hooks (eBPF/ETW), real malware, cloud or fleet features, and any claim about performance on real attacks. All attack traces are <strong>synthetic</strong>.</p>
+<hr>
+<h2>2. Technology Stack</h2>
+<h3>Programming languages</h3>
+<table><thead><tr><th>Language</th><th>Version</th><th>Used for</th></tr></thead><tbody><tr><td>Python</td><td>3.12</td><td>Monitoring agent, statistics, gate, sampling controller, evaluation harness, API server</td></tr><tr><td>TypeScript</td><td>5.5</td><td>Dashboard application logic and types</td></tr><tr><td>TSX / React</td><td>18.3</td><td>Dashboard UI components</td></tr><tr><td>CSS (Tailwind)</td><td>3.4</td><td>Dashboard styling</td></tr></tbody></table>
+<h3>Backend libraries</h3>
+<table><thead><tr><th>Library</th><th>Version</th><th>Role</th></tr></thead><tbody><tr><td>FastAPI</td><td>0.111</td><td>REST + WebSocket API</td></tr><tr><td>Uvicorn</td><td>0.29</td><td>ASGI server</td></tr><tr><td>Pydantic</td><td>2.7</td><td>Request/response models</td></tr><tr><td>NumPy</td><td>1.26</td><td>Vectors, covariance, linear algebra</td></tr><tr><td>SciPy</td><td>1.13</td><td>Chi-squared risk percentiles</td></tr><tr><td>psutil</td><td>5.9</td><td>Live per-process telemetry</td></tr><tr><td>websockets</td><td>12.0</td><td>WebSocket transport</td></tr></tbody></table>
+<h3>Frontend libraries</h3>
+<table><thead><tr><th>Library</th><th>Version</th><th>Role</th></tr></thead><tbody><tr><td>React</td><td>18.3</td><td>Component framework</td></tr><tr><td>Vite</td><td>5.3</td><td>Dev server and bundler (proxies <code>/api</code> and <code>/ws</code>)</td></tr><tr><td>Recharts</td><td>2.12</td><td>Charts</td></tr><tr><td>TailwindCSS</td><td>3.4</td><td>Utility-first styling</td></tr></tbody></table>
+<h3>Testing and tooling</h3>
+<table><thead><tr><th>Tool</th><th>Role</th></tr></thead><tbody><tr><td>Python <code>unittest</code> (standard library)</td><td>Unit and integration tests (no <code>pytest</code> dependency)</td></tr><tr><td>Node.js 23 / npm 10</td><td>Frontend build and dev server</td></tr><tr><td>Git / GitHub</td><td>Version control and repository hosting</td></tr></tbody></table>
+<p>The project is developed and tested on macOS (Darwin) with Python 3.12.4; the backend is pure Python and portable to Linux.</p>
+<hr>
+<h2>3. System Architecture</h2>
+<p>The agent is a <strong>per-tick pipeline</strong>. Telemetry is collected at a tier chosen by the sampling controller, scored against a context-specific baseline, passed through the gate, and then either learned, quarantined or alerted on.</p>
+<pre><code>                       ┌──────────────────────────────────────────────┐
+                       │              MonitorAgent (agent.py)          │
+                       └──────────────────────────────────────────────┘
+ Collector ──► Feature Builder ──► Identity/Context ──► Baseline Store
+   ▲                                                        │
+   │ sampling tier                    Joint Scorer ──► Explainer ──► Response Engine
+   │                                                        │
+ Sampling Controller ◄── freeze request ◄── Divergence Gate ◄─► Quarantine Buffer
+   ▲                                                        │
+ Self-Meter (agent CPU / RSS)                     Corroboration sources</code></pre>
+<h3>Per-tick data flow</h3>
+<ol><li>The controller assigns a sampling tier to every process, in priority order, within the</li></ol>
+<p>cost budget.</p>
+<ol><li>The collector returns samples for the processes due at that tier. Tier 0 returns only</li></ol>
+<p>the cheap features (CPU and memory).</p>
+<ol><li>Each full sample becomes a log-scale feature vector and is keyed by application identity</li></ol>
+<p>and context.</p>
+<ol><li>The store picks the context-specific baseline if it is trusted, otherwise the coarse</li></ol>
+<p>application baseline (<code>&quot;*&quot;</code>).</p>
+<ol><li>The scorer computes the joint deviation <code>D²</code> and a risk value.</li><li>The gate updates its drift measures and decides whether to learn, freeze, merge or</li></ol>
+<p>discard.</p>
+<ol><li>Alerts fire after several consecutive high-risk samples and carry the ranked feature</li></ol>
+<p>contributions.</p>
+<ol><li>The self-meter reads the agent&#x27;s own usage each window and the controller adjusts the</li></ol>
+<p>budget.</p>
+<p>During the warm-up period every sample is used for learning and nothing is scored, so new baselines are not judged on a handful of samples.</p>
+<hr>
+<h2>4. Implementation Details</h2>
+<p>The backend is organised into small modules, each mapping to a module contract in the design document. The table below summarises the module map; the subsections that follow describe each module in detail.</p>
+<table><thead><tr><th>Module</th><th>Responsibility</th></tr></thead><tbody><tr><td><code>agent/collector.py</code></td><td><code>ReplayCollector</code> (synthetic traces) and <code>PsutilCollector</code> (live sampling)</td></tr><tr><td><code>agent/features.py</code></td><td>Log-scale feature vector, stable identity, time/parent context</td></tr><tr><td><code>agent/baseline.py</code></td><td><code>Gaussian</code>, <code>KeyState</code>, <code>QuarantineBuffer</code>, <code>BaselineStore</code></td></tr><tr><td><code>agent/scoring.py</code></td><td>Regularized joint Mahalanobis score and ranked contributions</td></tr><tr><td><code>agent/isolation.py</code></td><td>Isolation-forest ablation (Review 1 prior work) — not the default detector</td></tr><tr><td><code>agent/gate.py</code></td><td>Drift measures, gate state machine, quarantine, corroboration</td></tr><tr><td><code>agent/sampling.py</code></td><td><code>SelfMeter</code>, <code>SamplingController</code>, <code>LatencyTracker</code></td></tr><tr><td><code>agent/response.py</code></td><td>Graduated responses, dry-run, rollback</td></tr><tr><td><code>agent/agent.py</code></td><td>Wires the pipeline and runs the loops</td></tr><tr><td><code>agent/config.py</code></td><td>All tunable parameters</td></tr><tr><td><code>agent/data_model.py</code></td><td>Shared data types</td></tr><tr><td><code>agent/scenarios.py</code></td><td>Synthetic traces for the experiment scenarios</td></tr><tr><td><code>agent/evaluation.py</code></td><td>Variants, scenario runner, metrics table</td></tr><tr><td><code>agent/api.py</code></td><td>FastAPI REST + WebSocket</td></tr><tr><td><code>agent/models.py</code></td><td>Pydantic response models</td></tr><tr><td><code>backend/simulator.py</code></td><td>Standalone demo / replay / live runner</td></tr><tr><td><code>backend/evaluate.py</code></td><td>Evaluation harness CLI</td></tr></tbody></table>
+<h3>4.1 Feature model</h3>
+<p>Five canonical features are used per process, matching the design document:</p>
+<table><thead><tr><th>Index</th><th>Feature</th><th>Unit</th><th>Notes</th></tr></thead><tbody><tr><td>0</td><td><code>cpu_pct</code></td><td>% CPU</td><td></td></tr><tr><td>1</td><td><code>rss_mb</code></td><td>MB</td><td>Resident memory</td></tr><tr><td>2</td><td><code>disk_io_kbps</code></td><td>KB/s</td><td>Combined read + write</td></tr><tr><td>3</td><td><code>net_kbps</code></td><td>KB/s</td><td>Combined network; live mode uses an open-socket-count proxy</td></tr><tr><td>4</td><td><code>child_rate</code></td><td>procs/s</td><td>Rate of new child processes</td></tr></tbody></table>
+<p>Live <code>psutil</code> collection has no per-process network byte counter, so the live collector uses the <strong>open-socket count as a proxy</strong>. Real byte counts require eBPF or ETW, which are explicitly out of scope.</p>
+<p>Each full sample is transformed to a <strong>log-scale</strong> vector with <code>log1p(max(x, 0))</code> so that multiplicative and heavy-tailed resources behave additively and the Gaussian assumptions of the scorer are more reasonable.</p>
+<h3>4.2 Identity and context</h3>
+<p>A baseline must survive <strong>PID reuse</strong>, so two identities are maintained:</p>
+<ul><li><strong>application identity</strong> — a 16-hex-character hash of the normalised executable name</li></ul>
+<p>(<code>application_id()</code> in <code>features.py</code>); a restarted process reuses the same baseline.</p>
+<ul><li><strong>process instance identity</strong> — <code>pid@start_time</code> (<code>process_instance_id()</code>).</li></ul>
+<p>The context discriminator is <code>time-bucket|username|parent</code>, where the time bucket is one of <code>night</code>, <code>morning</code>, <code>afternoon</code>, <code>evening</code>. This prevents a midnight cron job from being scored against a daytime interactive baseline. A <code>BaselineKey</code> is <code>(application_id, context)</code>; the coarse fallback context is the literal <code>&quot;*&quot;</code>.</p>
+<h3>4.3 Collector</h3>
+<p>Two collectors implement the same contract and both return <code>Sample</code> objects:</p>
+<ul><li><strong>`ReplayCollector`</strong> replays synthetic traces deterministically at the tier requested by</li></ul>
+<p>the controller, honouring each tier&#x27;s sampling interval and feature mask. It drives the evaluation harness and unit tests.</p>
+<ul><li><strong>`PsutilCollector`</strong> performs live sampling on a real machine: CPU percent, RSS,</li></ul>
+<p>disk read+write rate, open-socket count (network proxy) and child-process rate.</p>
+<h3>4.4 Baseline statistics and store</h3>
+<ul><li><strong>`Gaussian`</strong> holds an effective count <code>n</code>, a mean vector and a covariance matrix. It</li></ul>
+<p>supports an <strong>exact online (Welford) update</strong>, an <strong>exponentially-weighted (EWMA) update</strong> (used for the short and long baselines so they react at different rates), and an <strong>exact parallel merge</strong> used when quarantined samples are reconciled. The mean and covariance are stored unregularized; every consumer adds its own ridge.</p>
+<ul><li><strong>`KeyState`</strong> holds the short, long and reference Gaussians, the gate state, the CUSUM</li></ul>
+<p>accumulator, the quarantine buffer, and freeze bookkeeping for one <code>BaselineKey</code>.</p>
+<ul><li><strong>`BaselineStore`</strong> maps <code>BaselineKey → KeyState</code> with <strong>coarse fallback</strong> and **LRU</li></ul>
+<p>eviction** (default cap 256 keys). All dict access is serialized with an <code>RLock</code> because the monitoring thread mutates the store while the API/WebSocket threads snapshot it.</p>
+<h3>4.5 Joint scorer</h3>
+<p>The scorer computes a <strong>regularized joint Mahalanobis distance</strong> between a sample&#x27;s log-scale vector and the long baseline:</p>
+<pre><code>D² = (x − μ)ᵀ (Σ + λI)⁻¹ (x − μ)</code></pre>
+<p>Because <code>Σ</code> captures correlations between resources, the score detects *combinations* of moderate deviations rather than double-counting correlated ones. The risk value is the chi-squared CDF at <code>df = 5</code>. Each alert carries <strong>ranked per-feature contributions</strong> <code>δᵢ · (Σ⁻¹δ)ᵢ / D²</code>, so a reviewer can see exactly which resource drove the alert.</p>
+<h3>4.6 Divergence gate</h3>
+<p>Three drift measures guard against slow poisoning:</p>
+<ul><li><strong>Mean shift</strong> — RMS standardized shift between the short and long baselines.</li><li><strong>CUSUM</strong> — an accumulated excess of small deviations that a single threshold would miss.</li><li><strong>Reference drift</strong> — shift between the long baseline and a trusted reference snapshot,</li></ul>
+<p>which catches an attacker who moves both short and long baselines together.</p>
+<p>The gate is a state machine per key:</p>
+<table><thead><tr><th>State</th><th>Behaviour</th><th>Exit</th></tr></thead><tbody><tr><td>NORMAL</td><td>Short baseline always learns; long baseline learns only if the sample score is under the update guard</td><td>Freeze when mean shift, CUSUM or reference drift crosses its threshold</td></tr><tr><td>FROZEN</td><td>Long baseline is not updated; samples go to quarantine; the key is flagged</td><td>MERGE on independent corroboration, DISCARD when the TTL expires</td></tr><tr><td>MERGE</td><td>Buffer summary is merged into the long baseline; reference reset; CUSUM cleared</td><td>Back to NORMAL</td></tr><tr><td>DISCARD</td><td>Buffer dropped; short baseline reset to the long baseline</td><td>Back to NORMAL; the gate may freeze again</td></tr></tbody></table>
+<p>Drift measures are standardized by the <strong>trusted reference</strong> covariance (not the live long covariance), so a slow ramp cannot hide by inflating the long baseline&#x27;s own variance. The reference snapshot is taken once the long baseline has converged (<code>2 × min_samples</code>).</p>
+<h3>4.7 Sampling controller and self-meter</h3>
+<p>The controller keeps a <strong>cost budget in units per tick</strong>. When measured agent CPU exceeds the target the budget shrinks by 20%; when usage stays below 70% of the target for several windows the budget grows by 15%. The asymmetric thresholds and the dwell count provide <strong>hysteresis</strong> and prevent oscillation.</p>
+<table><thead><tr><th>Tier</th><th>Interval</th><th>Features</th><th>Cost / tick</th></tr></thead><tbody><tr><td>0 — MINIMAL</td><td>every 8 ticks</td><td>CPU + memory only</td><td>0.125 units</td></tr><tr><td>1 — NORMAL</td><td>every 2 ticks</td><td>all five</td><td>2 units</td></tr><tr><td>2 — DETAILED</td><td>every tick</td><td>all five</td><td>4 units</td></tr></tbody></table>
+<p>When the budget is tight, processes are served in <strong>priority order</strong>: flagged and high-risk processes first. Every process keeps at least tier 0, and each tick where a process receives less than it wanted is counted as <strong>reduced coverage</strong> (a signal that load may be pushing the monitor into degraded sampling).</p>
+<p>A <code>LatencyTracker</code> records per-sample processing latency and reports <code>p50</code>/<code>p95</code>/<code>p99</code> (the design&#x27;s live-run metric).</p>
+<h3>4.8 Response engine</h3>
+<p>Risk levels map to graduated responses:</p>
+<table><thead><tr><th>Risk level</th><th>Severity</th><th>Response</th></tr></thead><tbody><tr><td>NORMAL</td><td>none</td><td>log only</td></tr><tr><td>NOTIFY</td><td>medium</td><td>notify administrator</td></tr><tr><td>THROTTLE</td><td>high</td><td>escalate sampling tier + notify</td></tr><tr><td>SUSPEND</td><td>critical</td><td>consider suspension (dry-run unless enabled)</td></tr></tbody></table>
+<p>Alerts fire only after <code>alert_consecutive</code> (default 3) consecutive high-risk samples. All disruptive actions are recorded as reversible <code>RollbackAction</code>s. The engine stays in <strong>dry-run mode by default</strong> so automated suspension cannot disrupt legitimate processes.</p>
+<h3>4.9 Agent orchestrator and interlocks</h3>
+<p><code>MonitorAgent</code> wires the pipeline together and runs the two loops each tick. It maintains both the exact-context baseline and the coarse (<code>&quot;*&quot;</code>) baseline, and applies two interlocks:</p>
+<ol><li>a baseline <strong>freeze</strong> marks the process flagged and raises its desired tier to DETAILED;</li><li>a <strong>THROTTLE</strong> response escalates the tier through the response engine&#x27;s callback.</li></ol>
+<h3>4.10 API and dashboard</h3>
+<p>The backend exposes a REST API under <code>/api</code> and a WebSocket at <code>/ws</code>. The React dashboard connects to the WebSocket for live status and polls the REST endpoints for alerts, baselines and processes. It has four views: <strong>Overview</strong> (status cards, overhead gauges, overhead chart, recent alerts), <strong>Alerts</strong> (explainable alert feed), <strong>Baselines</strong> (short/long bars, gate state, quarantine counts, reconcile button) and <strong>Processes</strong> (risk, baseline state and sampling tier per process).</p>
+<hr>
+<h2>5. Configuration Details</h2>
+<p>All parameters live in <code>agent/config.py</code>. The defaults below are <strong>starting points</strong>; the design document says to choose final values from experiments, and the evaluation harness is used to re-tune them.</p>
+<table><thead><tr><th>Parameter</th><th>Default</th><th>Meaning</th></tr></thead><tbody><tr><td><code>baseline.alpha_short</code> / <code>alpha_long</code></td><td>0.1 / 0.01</td><td>EWMA rates of the two baselines</td></tr><tr><td><code>baseline.min_samples</code></td><td>30</td><td>Samples before a baseline is trusted</td></tr><tr><td><code>baseline.ridge</code></td><td>0.02</td><td>Covariance regularization (minimum tolerance, log units)</td></tr><tr><td><code>baseline.max_entries</code></td><td>256</td><td>LRU cap on stored (application, context) keys</td></tr><tr><td><code>gate.shift_thr</code></td><td>1.5</td><td>Short-vs-long standardized shift that triggers a freeze</td></tr><tr><td><code>gate.cusum_k</code> / <code>cusum_h</code></td><td>0.5 / 12.0</td><td>CUSUM allowance (slack) and alarm level</td></tr><tr><td><code>gate.ref_thr</code></td><td>1.0</td><td>Long-vs-reference shift that triggers a freeze</td></tr><tr><td><code>gate.update_guard</code></td><td>3.0</td><td>Per-sample score above which the long baseline does not learn</td></tr><tr><td><code>gate.ttl_days</code></td><td>1.0</td><td>Lifetime of an uncorroborated quarantine buffer</td></tr><tr><td><code>gate.max_buffers</code> / <code>max_buffer_samples</code></td><td>64 / 512</td><td>Buffer caps</td></tr><tr><td><code>score.notify</code> / <code>throttle</code> / <code>suspend</code></td><td>0.995 / 0.9995 / 0.99995</td><td>Chi-squared risk percentiles for response levels</td></tr><tr><td><code>score.alert_consecutive</code></td><td>3</td><td>Consecutive high-risk samples before an alert fires</td></tr><tr><td><code>sampling.cpu_budget_pct</code></td><td>1.0</td><td>Target agent CPU use (percent of one core)</td></tr><tr><td><code>sampling.window_ticks</code></td><td>20</td><td>Self-meter measurement window</td></tr><tr><td><code>sampling.budget_shrink</code> / <code>budget_grow</code></td><td>0.20 / 0.15</td><td>Budget change per over/under window</td></tr><tr><td><code>sampling.grow_threshold</code> / <code>dwell_count</code></td><td>0.70 / 3</td><td>Grow only after several under-target windows</td></tr><tr><td><code>sampling.initial_budget</code> / <code>min</code> / <code>max</code></td><td>64 / 4 / 512</td><td>Cost-budget bounds (units per tick)</td></tr><tr><td><code>dry_run</code></td><td>True</td><td>Disruptive responses are logged, not executed</td></tr><tr><td><code>ticks_per_day</code></td><td>1440</td><td>Replay ticks representing one simulated day</td></tr></tbody></table>
+<p><strong>Tuned in practice.</strong> Two knobs were adjusted from the design defaults after experiments: the diurnal amplitude in <code>scenarios._diurnal</code> is <code>0.08</code>, and the gate&#x27;s standardization ridge <code>_GATE_RIDGE</code> is <code>1e-3</code>.</p>
+<p><strong>Runtime environment variables</strong> (API server):</p>
+<table><thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead><tbody><tr><td><code>OSMON_LIVE</code></td><td><code>0</code></td><td><code>1</code> uses live psutil collection instead of replay</td></tr><tr><td><code>OSMON_TICK_INTERVAL</code></td><td><code>0.5</code></td><td>Seconds per tick (smaller = faster simulated demo)</td></tr></tbody></table>
+<hr>
+<h2>6. Algorithms</h2>
+<h3>6.1 Joint Mahalanobis deviation</h3>
+<p>Given the long-baseline mean <code>μ</code> and regularized covariance <code>Σ + λI</code>, the deviation and risk are:</p>
+<pre><code>δ  = x − μ
+D² = δᵀ (Σ + λI)⁻¹ δ
+risk = chi2.cdf(D², df = 5)</code></pre>
+<p>Per-feature contribution <code>cᵢ = δᵢ (Σ⁻¹δ)ᵢ / D²</code>, ranked by magnitude, with a z-score <code>δᵢ / σᵢ</code> for direction.</p>
+<h3>6.2 CUSUM slow-drift detector</h3>
+<p>Each sample is mapped to a unit-variance excess centered on the long baseline and scaled by the reference covariance:</p>
+<pre><code>e_t = (δᵀ Σ_ref⁻¹ δ − df) / sqrt(2·df)
+S_t = max(0, S_{t−1} + (e_t − k))</code></pre>
+<p>A freeze occurs when <code>S_t ≥ h</code>. Because a benign stream averages zero, <code>k</code> and <code>h</code> are meaningful in standard-deviation units.</p>
+<h3>6.3 Budget hysteresis</h3>
+<pre><code>if cpu &gt; target:               budget ← budget · (1 − 0.20); violations += 1
+elif cpu ≤ 0.70 · target:      dwell += 1; if dwell ≥ 3: budget ← budget · (1 + 0.15); dwell ← 0
+else:                          dwell ← 0
+budget ← clamp(budget, min_budget, max_budget)</code></pre>
+<h3>6.4 Exact Gaussian merge</h3>
+<p>For two Gaussians with counts <code>n₁</code>, <code>n₂</code>:</p>
+<pre><code>n  = n₁ + n₂
+μ  = μ₁ + (μ₂ − μ₁)·n₂/n
+Σ  = [ n₁Σ₁ + n₂Σ₂ + (n₁n₂/n)·(μ₂−μ₁)(μ₂−μ₁)ᵀ ] / n</code></pre>
+<p>This is used when quarantined samples are reconciled after corroboration.</p>
+<hr>
+<h2>7. Testing</h2>
+<p>The project uses the Python standard-library <code>unittest</code> runner (no <code>pytest</code> dependency). There are <strong>30 tests</strong> across two files:</p>
+<ul><li><code>backend/tests/test_collector_sampling_response.py</code> — the authoritative contract tests for</li></ul>
+<p>the collector, self-meter, sampling controller and response engine (9 tests).</p>
+<ul><li><code>backend/tests/test_pipeline.py</code> — baselines, store fallback, LRU, scorer, gate</li></ul>
+<p>freeze/quarantine/corroboration/TTL, interlock, latency, concurrent-snapshot safety, the isolation-forest ablation, evaluator fairness and end-to-end agent behaviour (21 tests).</p>
+<p>Run them with:</p>
+<pre><code>cd backend
+python -m unittest discover -s tests</code></pre>
+<figure><img src='screenshots/05_tests.png' alt='Unit test suite passing'><figcaption>Unit test suite passing</figcaption></figure>
+<hr>
+<h2>8. Evaluation Results</h2>
+<p>The evaluation harness (<code>backend/evaluate.py</code>) compares six variants against five scenarios:</p>
+<ul><li><strong>Variants:</strong> <code>static</code>, <code>plain_adaptive</code>, <code>gate_only</code>, <code>budget_only</code>, <code>full</code>, and the</li></ul>
+<p><code>iforest</code> ablation (Review 1 §6 prior work). The <code>gate_only</code> and <code>budget_only</code> variants isolate each controller, and <code>iforest</code> is the conventional point-anomaly detector evaluated on the same scenarios.</p>
+<ul><li><strong>Scenarios:</strong> <code>benign</code>, <code>slow_ramp</code>, <code>evading_ramp</code>, <code>legit_step</code>, <code>overhead</code>.</li><li>Every variant is evaluated on a <strong>freshly rebuilt</strong> scenario, so the stateful replay RNG</li></ul>
+<p>feeds each variant an identical noise stream.</p>
+<p>Reference results from <code>python evaluate.py --quick</code> (all replay; <code>det</code> is attack detection, <code>after</code> is alerts remaining after the legitimate step, <code>recov(d)</code> is days from corroboration until the alerts stop):</p>
+<table><thead><tr><th>scenario</th><th>variant</th><th>det</th><th>delay(d)</th><th>atk_alerts</th><th>FP/proc/day</th><th>freezes</th><th>cpu%</th><th>viol</th><th>reduced</th><th>after</th><th>recov(d)</th></tr></thead><tbody><tr><td>benign</td><td>static</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.02</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>benign</td><td>plain_adaptive</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.02</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>benign</td><td>gate_only</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.02</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>benign</td><td>budget_only</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.02</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>benign</td><td>full</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.02</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>benign</td><td>iforest</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.02</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>slow_ramp</td><td>static</td><td>yes</td><td>0.92</td><td>240</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>slow_ramp</td><td>plain_adaptive</td><td>yes</td><td>1.17</td><td>1</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>slow_ramp</td><td>gate_only</td><td>yes</td><td>0.92</td><td>433</td><td>0.0000</td><td>7</td><td>0.04</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>slow_ramp</td><td>budget_only</td><td>yes</td><td>1.17</td><td>1</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>slow_ramp</td><td>full</td><td>yes</td><td>0.92</td><td>433</td><td>0.0000</td><td>7</td><td>0.04</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>slow_ramp</td><td>iforest</td><td>no</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>evading_ramp</td><td>static</td><td>yes</td><td>1.12</td><td>253</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>evading_ramp</td><td>plain_adaptive</td><td>no</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>evading_ramp</td><td>gate_only</td><td>yes</td><td>1.92</td><td>466</td><td>0.0000</td><td>8</td><td>0.04</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>evading_ramp</td><td>budget_only</td><td>no</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>evading_ramp</td><td>full</td><td>yes</td><td>1.92</td><td>466</td><td>0.0000</td><td>8</td><td>0.04</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>evading_ramp</td><td>iforest</td><td>no</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>legit_step</td><td>static</td><td>-</td><td>-</td><td>0</td><td>-</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>240</td><td>0.50</td></tr><tr><td>legit_step</td><td>plain_adaptive</td><td>-</td><td>-</td><td>0</td><td>-</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>4</td><td>0.25</td></tr><tr><td>legit_step</td><td>gate_only</td><td>-</td><td>-</td><td>0</td><td>-</td><td>4</td><td>0.03</td><td>0</td><td>0</td><td>480</td><td>0.50</td></tr><tr><td>legit_step</td><td>budget_only</td><td>-</td><td>-</td><td>0</td><td>-</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>4</td><td>0.25</td></tr><tr><td>legit_step</td><td>full</td><td>-</td><td>-</td><td>0</td><td>-</td><td>4</td><td>0.03</td><td>0</td><td>0</td><td>480</td><td>0.50</td></tr><tr><td>legit_step</td><td>iforest</td><td>-</td><td>-</td><td>0</td><td>-</td><td>0</td><td>0.03</td><td>0</td><td>0</td><td>0</td><td>0.00</td></tr><tr><td>overhead</td><td>static</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.24</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>overhead</td><td>plain_adaptive</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.24</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>overhead</td><td>gate_only</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.24</td><td>0</td><td>0</td><td>-</td><td>-</td></tr><tr><td>overhead</td><td>budget_only</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.23</td><td>0</td><td>15</td><td>-</td><td>-</td></tr><tr><td>overhead</td><td>full</td><td>-</td><td>-</td><td>0</td><td>0.0000</td><td>0</td><td>0.23</td><td>0</td><td>15</td><td>-</td><td>-</td></tr><tr><td>overhead</td><td>iforest</td><td>-</td><td>-</td><td>0</td><td>0.6400</td><td>0</td><td>0.24</td><td>0</td><td>0</td><td>-</td><td>-</td></tr></tbody></table>
+<h3>Interpretation</h3>
+<ul><li><strong>No false-positive alerts</strong> on the benign scenario for any variant (0 episodes per</li></ul>
+<p>process-day), and no benign freezes for the gate variants.</p>
+<ul><li>A <strong>non-adapting baseline</strong> (<code>static</code>) detects both ramps (0.92 d / 1.12 d) precisely</li></ul>
+<p>because it never learns — but it cannot adapt to legitimate change, so on <code>legit_step</code> it keeps alerting (240 alerts after the step) and needs a manual reset. It is not viable in practice.</p>
+<ul><li>An <strong>adaptive baseline without the gate</strong> (<code>plain_adaptive</code>, <code>budget_only</code>) produces at</li></ul>
+<p>most a <strong>single</strong> late alert on the gradual ramp (1.17 d, <code>atk_alerts = 1</code>) and <strong>none</strong> on the evading ramp, versus 433–466 sustained alerts for the gate variants. On <code>legit_step</code> it recovers fast (4 alerts after, 0.25 d) — the very adaptation that makes it convenient is what makes it poisonable. The binary <code>det</code> column marks <code>yes</code> for that one marginal alert; the alert count is the meaningful number.</p>
+<ul><li>The <strong>divergence gate</strong> (<code>gate_only</code>, <code>full</code>) restores sustained ramp detection</li></ul>
+<p>(0.92 d / 1.92 d, 433–466 alerts) while still absorbing benign traffic, which is the central result. The evading ramp is caught by <strong>reference drift</strong> at ~1.92 days. The cost is visible on <code>legit_step</code>: the gate freezes and only clears ~0.50 days after administrator corroboration.</p>
+<ul><li>The <strong>budget controller</strong> is active only under load (<code>overhead</code>): <code>budget_only</code> and <code>full</code></li></ul>
+<p>reduce coverage for 15 ticks and hold modeled CPU near 0.23% (versus 0.24% for the non-budget variants), with no budget violations.</p>
+<ul><li><strong>Per-sample latency</strong> is reported by the harness but is wall-clock and machine dependent,</li></ul>
+<p>so it is omitted from the table. In these runs the Gaussian scorer is ≈0.3–0.8 ms p50, while the isolation-forest ablation is ≈4–6 ms p50 (roughly an order of magnitude higher), because every sample is pushed through every tree.</p>
+<h3>8.1 Isolation-forest ablation (Review 1 prior work)</h3>
+<p>Review 1 §6 identifies isolation forest as a lightweight but <strong>batch-oriented</strong> alternative whose &quot;standard implementations require retraining or modification for incremental learning&quot; [6]. It is therefore not part of the proposed solution, but it is implemented as an <strong>ablation</strong> so the contribution of the divergence gate can be isolated empirically.</p>
+<p>Implementation (<code>agent/isolation.py</code>, variant <code>iforest</code>):</p>
+<ul><li>one <strong>global</strong> forest — a per-key forest sees only 30–60 samples per warm-up window, which</li></ul>
+<p>is too few to calibrate a 0.5% alert tail;</p>
+<ul><li>refit every 120 ticks on a 256-sample sliding window, the minimal modification needed for</li></ul>
+<p>incremental operation;</p>
+<ul><li>the raw score is converted to a risk with an <strong>empirical tail probability</strong> against the</li></ul>
+<p>reference window, so the same <code>notify</code> / <code>throttle</code> / <code>suspend</code> thresholds apply unchanged;</p>
+<ul><li>no gate and no budget, matching a conventional detector baseline;</li><li>explanations rank features by robust departure (median/IQR), because iForest exposes no</li></ul>
+<p>closed-form per-feature attribution.</p>
+<p>The ablation <strong>misses both ramps</strong> (<code>det = no</code>) and raises no alerts on <code>legit_step</code>, which is the expected behaviour of a point-anomaly detector: a slow ramp is a *collective* drift that stays inside the normal cloud, so no individual point is isolated. On the heterogeneous <code>overhead</code> fleet it also produces false positives, because one global forest has no per-application context and flags normal heavy processes as fleet outliers. Unit tests confirm that it *does* score coordinated multi-resource outliers highly, and that a one-feature shift is not detected even when extreme — two limitations of the point-anomaly approach that the proposed per-key, correlation-aware scorer does not share.</p>
+<p>Periodic refitting also creates a new poisoning channel: an attacker who influences the refit window shapes the forest. Together with the order-of-magnitude per-sample cost, these results support the design choice: the gate turns an adaptive, context-aware baseline into a poisoning-resistant detector, and the budget controller is what keeps sampling affordable.</p>
+<figure><img src='screenshots/06_evaluation.png' alt='Evaluation harness output'><figcaption>Evaluation harness output</figcaption></figure>
+<hr>
+<h2>9. Output Screenshots</h2>
+<p>The screenshots below were captured from the live dashboard and the command-line tools.</p>
+<h3>9.1 Dashboard — Overview</h3>
+<p>Status cards (processes, alerts, frozen baselines, budget), the agent-overhead gauges and live chart, and the explainable alert feed with ranked feature contributions.</p>
+<figure><img src='screenshots/01_overview.png' alt='Dashboard overview'><figcaption>Dashboard overview</figcaption></figure>
+<h3>9.2 Dashboard — Alerts</h3>
+<p>The alert feed shows severity badges (NOTIFY / THROTTLE / SUSPEND), the process and PID, the plain-language explanation and the top contributing features with z-scores.</p>
+<figure><img src='screenshots/02_alerts.png' alt='Alert feed'><figcaption>Alert feed</figcaption></figure>
+<h3>9.3 Dashboard — Baselines</h3>
+<p>Each baseline shows short-term and long-term statistics per feature, the gate state, the number of quarantined samples and a Reconcile button. The four attack processes are <strong>FROZEN</strong> with samples held in quarantine.</p>
+<figure><img src='screenshots/03_baselines.png' alt='Baseline store'><figcaption>Baseline store</figcaption></figure>
+<h3>9.4 Dashboard — Processes</h3>
+<p>Per-process risk, baseline state and assigned sampling tier. Flagged/frozen processes are escalated to the DETAILED tier.</p>
+<figure><img src='screenshots/04_processes.png' alt='Monitored processes'><figcaption>Monitored processes</figcaption></figure>
+<h3>9.5 API documentation</h3>
+<p>The FastAPI interactive documentation served at <code>/docs</code>.</p>
+<figure><img src='screenshots/07_api_docs.png' alt='API documentation'><figcaption>API documentation</figcaption></figure>
+<hr>
+<h2>10. How to Run</h2>
+<h3>Backend</h3>
+<pre><code>cd backend
+pip install -r requirements.txt
+
+# API server + dashboard backend (simulation mode by default)
+python main.py                     # http://localhost:8000  (docs at /docs)
+# or: uvicorn agent.api:app --port 8000
+
+# Live psutil collection instead of replay:
+OSMON_LIVE=1 python main.py
+
+# Faster simulated demo (for screenshots):
+OSMON_TICK_INTERVAL=0.15 python main.py
+
+# Standalone simulator
+python simulator.py --scenario demo --ticks 600
+
+# Evaluation harness
+python evaluate.py --quick</code></pre>
+<h3>Frontend dashboard</h3>
+<pre><code>cd frontend
+npm install
+npm run dev        # http://localhost:3000, proxies /api and /ws to :8000
+npm run build      # production build into dist/</code></pre>
+<h3>Tests</h3>
+<pre><code>cd backend
+python -m unittest discover -s tests</code></pre>
+<hr>
+<h2>11. Claim-to-Code Map</h2>
+<p>This table is the evidence trail from each design claim to the code and the test or experiment that proves it.</p>
+<table><thead><tr><th>Claim step</th><th>Implemented in</th><th>Proved by</th></tr></thead><tbody><tr><td>Collect multi-resource telemetry</td><td><code>collector</code>, <code>features</code></td><td><code>TestReplayCollector</code>, <code>TestPsutilCollector</code>; replay runs</td></tr><tr><td>Context vector and context-specific baseline</td><td><code>features</code>, <code>baseline</code></td><td><code>TestStore</code>; <code>benign</code> scenario false positives</td></tr><tr><td>Joint deviation score with correlations</td><td><code>scoring.mahalanobis</code></td><td><code>TestScorer</code></td></tr><tr><td>Divergence between short and long baselines, freeze</td><td><code>gate</code> (mean shift, CUSUM, reference drift, state machine)</td><td><code>TestGate</code>; <code>slow_ramp</code>, <code>evading_ramp</code></td></tr><tr><td>Quarantine buffer and reconcile on independent corroboration</td><td><code>gate</code> + <code>baseline.QuarantineBuffer</code></td><td><code>TestGate</code>; <code>legit_step</code></td></tr><tr><td>Own-overhead measurement and budgeted sampling</td><td><code>sampling</code> (<code>SelfMeter</code>, <code>SamplingController</code>, <code>LatencyTracker</code>)</td><td><code>TestSelfMeter</code>, <code>TestSamplingController</code>, <code>TestLatency</code>; <code>overhead</code></td></tr><tr><td>Freeze raises sampling priority</td><td><code>agent._priorities</code>, <code>agent._on_throttle</code></td><td><code>TestInterlock</code></td></tr><tr><td>Ranked alert and graduated response</td><td><code>scoring.explain</code>, <code>response</code></td><td><code>TestResponseEngine</code></td></tr><tr><td>Isolation-forest ablation (Review 1 prior work)</td><td><code>isolation.IsolationScorer</code>, <code>evaluation.VARIANTS[&quot;iforest&quot;]</code></td><td><code>TestIsolationScorer</code>; <code>iforest</code> rows</td></tr></tbody></table>
+<hr>
+<h2>12. Limitations</h2>
+<ul><li>Attack traces are <strong>synthetic</strong>; no claim is made about performance on real attacks.</li><li>Divergence gating <strong>reduces but does not eliminate</strong> slow-poisoning risk. Reference drift</li></ul>
+<p>narrows the gap but also freezes on legitimate slow change, which then needs administrator confirmation.</p>
+<ul><li>Requiring independent corroboration means most buffers are discarded, so baselines can go</li></ul>
+<p>stale after real workload changes and raise false positives (measured by <code>legit_step</code>).</p>
+<ul><li>Load can push the monitor into degraded sampling; reduced coverage is counted and should</li></ul>
+<p>be treated as a risk signal.</p>
+<ul><li>A Python prototype <strong>overstates overhead</strong> because of interpreter cost.</li><li>Automated suspension can disrupt legitimate processes; responses stay in dry-run mode</li></ul>
+<p>unless explicitly enabled.</p>
+<hr>
+<h2>13. Repository and Access</h2>
+<table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><strong>GitHub repository</strong></td><td>https://github.com/gracymehndiratta/os-project</td></tr><tr><td><strong>Default branch</strong></td><td><code>main</code></td></tr><tr><td><strong>Access</strong></td><td>Repository is shared with the reviewers/course account with read access</td></tr></tbody></table>
+<h3>Repository layout</h3>
+<pre><code>os-project/
+├── README.md                 # Project overview, config, results, claim-to-code map
+├── .gitignore
+├── backend/
+│   ├── main.py               # API server entry point
+│   ├── simulator.py          # Standalone demo / replay / live runner
+│   ├── evaluate.py           # Evaluation harness CLI
+│   ├── requirements.txt
+│   ├── agent/                # Monitoring agent modules
+│   └── tests/                # unittest suite
+├── frontend/                 # React + Vite dashboard
+└── docs/                     # This report and screenshots</code></pre>
+<p>To grant review access, the repository owner adds the reviewer&#x27;s GitHub account under <strong>Settings → Collaborators and teams</strong> (read access).</p>
+</body></html>

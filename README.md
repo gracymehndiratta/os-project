@@ -54,6 +54,7 @@ scored, so new baselines are not judged on a handful of samples.
 | `agent/features.py` | Log-scale feature vector, stable application identity, time/parent context | (b)(c) |
 | `agent/baseline.py` | `Gaussian` (incremental mean/cov + exact merge), `KeyState`, `BaselineStore` with coarse fallback + LRU | (b) baselines |
 | `agent/scoring.py` | Regularized joint Mahalanobis `D²` + ranked per-feature contributions | (c)(g) |
+| `agent/isolation.py` | Isolation-forest ablation (Review 1 §6 prior work); windowed refit, empirical-percentile risk | ablation |
 | `agent/gate.py` | Mean-shift, CUSUM, reference drift; `NORMAL→FROZEN→MERGE/DISCARD`; quarantine; corroboration | (d)(e) |
 | `agent/sampling.py` | `SelfMeter` (own usage) and `SamplingController` (tier assignment, budget hysteresis, reduced coverage) | (f)(g) |
 | `agent/response.py` | Graduated responses (notify → throttle → suspend), dry-run by default, rollback | (g) |
@@ -81,6 +82,9 @@ python main.py                     # http://localhost:8000  (docs at /docs)
 
 # Live psutil collection instead of replay:
 OSMON_LIVE=1 python main.py
+
+# Quiet demo: one short attack burst that then settles
+OSMON_SCENARIO=single_alert OSMON_TICK_INTERVAL=0.2 python main.py
 
 # Standalone simulator
 python simulator.py --scenario demo --ticks 600
@@ -204,7 +208,8 @@ or a verified application update.
 
 ## Experiment plan and metrics
 
-Variants (design §9): `static`, `plain_adaptive`, `gate_only`, `budget_only`, `full`.
+Variants (design §9): `static`, `plain_adaptive`, `gate_only`, `budget_only`, `full`, plus
+`iforest` (the Review 1 §6 prior-work ablation).
 `gate_only` and `budget_only` are the ablations that show each controller contributes.
 
 Scenarios (design §9):
@@ -228,43 +233,63 @@ so it is omitted from the fixed reference table below; `agent.status()` exposes 
 
 | scenario | variant | det | delay(d) | atk_alerts | FP/proc/day | freezes | cpu% | reduced | after | recov(d) |
 |----------|---------|-----|----------|-----------|-------------|---------|------|---------|-------|----------|
-| benign | static | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
-| benign | plain_adaptive | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
-| benign | gate_only | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
-| benign | budget_only | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
-| benign | full | – | – | 0 | 0.0000 | 0 | 0.02 | 0 | – | – |
-| slow_ramp | static | yes | 0.94 | 235 | 0.0000 | 0 | 0.03 | 0 | – | – |
-| slow_ramp | **plain_adaptive** | **no** | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
-| slow_ramp | **gate_only** | **yes** | 0.94 | 351 | 0.0000 | 5 | 0.04 | 0 | – | – |
-| slow_ramp | **budget_only** | **no** | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
-| slow_ramp | **full** | **yes** | 0.94 | 355 | 0.0000 | 5 | 0.04 | 0 | – | – |
-| evading_ramp | static | yes | 1.12 | 282 | 0.0000 | 0 | 0.03 | 0 | – | – |
-| evading_ramp | plain_adaptive | no | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
-| evading_ramp | gate_only | yes | 1.94 | 360 | 0.0000 | 8 | 0.04 | 0 | – | – |
-| evading_ramp | budget_only | no | – | 0 | 0.0000 | 0 | 0.03 | 0 | – | – |
-| evading_ramp | full | yes | 1.94 | 358 | 0.0000 | 8 | 0.04 | 0 | – | – |
-| legit_step | static | – | – | 0 | – | 0 | 0.03 | 0 | 240 | 0.50 |
-| legit_step | plain_adaptive | – | – | 0 | – | 0 | 0.03 | 0 | 4 | 0.02 |
-| legit_step | gate_only | – | – | 0 | – | 5 | 0.03 | 0 | 360 | 0.27 |
-| legit_step | budget_only | – | – | 0 | – | 0 | 0.03 | 0 | 4 | 0.02 |
-| legit_step | full | – | – | 0 | – | 5 | 0.03 | 0 | 360 | 0.27 |
-| overhead | budget_only | – | – | 0 | 0.0000 | 0 | 0.23 | 15 | – | – |
-| overhead | full | – | – | 0 | 0.0000 | 0 | 0.23 | 15 | – | – |
+| benign | static | - | - | 0 | 0.0000 | 0 | 0.02 | 0 | - | - |
+| benign | plain_adaptive | - | - | 0 | 0.0000 | 0 | 0.02 | 0 | - | - |
+| benign | gate_only | - | - | 0 | 0.0000 | 0 | 0.02 | 0 | - | - |
+| benign | budget_only | - | - | 0 | 0.0000 | 0 | 0.02 | 0 | - | - |
+| benign | full | - | - | 0 | 0.0000 | 0 | 0.02 | 0 | - | - |
+| benign | iforest | - | - | 0 | 0.0000 | 0 | 0.02 | 0 | - | - |
+| slow_ramp | static | yes | 0.92 | 240 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| slow_ramp | plain_adaptive | yes | 1.17 | 1 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| slow_ramp | gate_only | yes | 0.92 | 433 | 0.0000 | 7 | 0.04 | 0 | - | - |
+| slow_ramp | budget_only | yes | 1.17 | 1 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| slow_ramp | full | yes | 0.92 | 433 | 0.0000 | 7 | 0.04 | 0 | - | - |
+| slow_ramp | iforest | no | - | 0 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| evading_ramp | static | yes | 1.12 | 253 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| evading_ramp | plain_adaptive | no | - | 0 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| evading_ramp | gate_only | yes | 1.92 | 466 | 0.0000 | 8 | 0.04 | 0 | - | - |
+| evading_ramp | budget_only | no | - | 0 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| evading_ramp | full | yes | 1.92 | 466 | 0.0000 | 8 | 0.04 | 0 | - | - |
+| evading_ramp | iforest | no | - | 0 | 0.0000 | 0 | 0.03 | 0 | - | - |
+| legit_step | static | - | - | 0 | - | 0 | 0.03 | 0 | 240 | 0.50 |
+| legit_step | plain_adaptive | - | - | 0 | - | 0 | 0.03 | 0 | 4 | 0.25 |
+| legit_step | gate_only | - | - | 0 | - | 4 | 0.03 | 0 | 480 | 0.50 |
+| legit_step | budget_only | - | - | 0 | - | 0 | 0.03 | 0 | 4 | 0.25 |
+| legit_step | full | - | - | 0 | - | 4 | 0.03 | 0 | 480 | 0.50 |
+| legit_step | iforest | - | - | 0 | - | 0 | 0.03 | 0 | 0 | 0.00 |
+| overhead | static | - | - | 0 | 0.0000 | 0 | 0.24 | 0 | - | - |
+| overhead | plain_adaptive | - | - | 0 | 0.0000 | 0 | 0.24 | 0 | - | - |
+| overhead | gate_only | - | - | 0 | 0.0000 | 0 | 0.24 | 0 | - | - |
+| overhead | budget_only | - | - | 0 | 0.0000 | 0 | 0.23 | 15 | - | - |
+| overhead | full | - | - | 0 | 0.0000 | 0 | 0.23 | 15 | - | - |
+| overhead | iforest | - | - | 0 | 0.6400 | 0 | 0.24 | 0 | - | - |
 
 What this shows:
 
-- **No false positives** on the benign scenario for any variant (0 episodes per process-day).
-- The gate ablations (`gate_only`, `full`) **detect both ramps** where `plain_adaptive` and
-  `budget_only` miss them; the evading ramp is caught by reference drift at ~1.94 days.
-- On `legit_step`, `plain_adaptive` absorbs the benign step almost immediately
-  (~0.02 days) — but that same fast adaptation is exactly why it misses the slow ramps. The
+- **No false-positive alerts** on the benign scenario for any variant (0 episodes per
+  process-day), and no benign freezes for the gate variants.
+- A **non-adapting baseline** (`static`) detects both ramps only because it never learns —
+  but it cannot adapt to legitimate change and keeps alerting for 240 alerts after
+  `legit_step`. It is not viable in practice.
+- An **adaptive baseline without the gate** (`plain_adaptive`, `budget_only`) produces at
+  most a single late alert on the gradual ramp (1.17 days) and none on the evading ramp,
+  versus 433–466 sustained alerts for the gate variants. The evading ramp is caught by the
+  gate through reference drift at ~1.92 days.
+- On `legit_step`, `plain_adaptive` absorbs the benign step almost immediately (4 alerts
+  after, ~0.25 days) — but that same fast adaptation is exactly why it is poisonable. The
   gate variants freeze on the step and only recover once the administrator corroborates
-  (~0.27 days after confirmation), which is the honest tradeoff of design §11.3.
+  (~0.50 days after confirmation), which is the honest tradeoff of design §11.3.
 - The budget controller is active under load (`overhead`): it reduces coverage for 15 ticks
-  and keeps modeled CPU near 0.23%.
+  and keeps modeled CPU near 0.23%, with no budget violations.
+- The **isolation-forest ablation** (Review 1 §6 prior work) misses both ramps and raises no
+  alerts on `legit_step`; it also produces 0.64 false positives per process-day on the
+  heterogeneous `overhead` fleet and costs roughly an order of magnitude more per sample. A
+  point-anomaly detector cannot see collective drift and has no per-application context.
 
-Numbers are from the fast `--quick` run and are deterministic; `python evaluate.py` runs
-the longer configuration. These are synthetic-trace results only (design §11).
+Numbers are from the fast `--quick` run; `python evaluate.py` runs the longer configuration.
+The harness rebuilds the scenario for every variant, so each sees the same noise stream.
+These are synthetic-trace results only (design §11). Per-sample latency is reported by the
+harness (p50 ≈ 0.18 ms, p95 ≈ 0.37 ms) but is wall-clock and machine dependent.
 
 ## Simulation mode
 

@@ -32,12 +32,24 @@ export default function BaselinesPanel({ baselines, onReconcile }: Props) {
     )
   }
 
-  // Group by process name, show first per pid
-  const unique = new Map<number, BaselineEntry>()
-  for (const b of baselines) {
-    if (!unique.has(b.pid)) unique.set(b.pid, b)
+  // One row per process. Prefer the most "interesting" context for a PID
+  // (a frozen/quarantined key is more informative than a learning one) and
+  // break ties by the most recently updated baseline.
+  const rank: Record<string, number> = {
+    FROZEN: 0, MERGE: 1, DISCARD: 2, LEARNING: 3, NORMAL: 4,
   }
-  const entries = Array.from(unique.values()).sort((a, b) => {
+  const byPid = new Map<number, BaselineEntry>()
+  for (const b of baselines) {
+    const cur = byPid.get(b.pid)
+    if (
+      !cur ||
+      (rank[b.state] ?? 9) < (rank[cur.state] ?? 9) ||
+      ((rank[b.state] ?? 9) === (rank[cur.state] ?? 9) && b.last_update > cur.last_update)
+    ) {
+      byPid.set(b.pid, b)
+    }
+  }
+  const entries = Array.from(byPid.values()).sort((a, b) => {
     const order: Record<string, number> = { FROZEN: 0, LEARNING: 1, NORMAL: 2, MERGE: 3, DISCARD: 4 }
     return (order[a.state] ?? 9) - (order[b.state] ?? 9)
   })

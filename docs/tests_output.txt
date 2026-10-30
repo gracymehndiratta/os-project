@@ -1,0 +1,30 @@
+test_collect (test_collector_sampling_response.TestPsutilCollector.test_collect) ... ok
+test_default_tier_normal_collection (test_collector_sampling_response.TestReplayCollector.test_default_tier_normal_collection) ... ok
+test_tier_intervals_and_masking (test_collector_sampling_response.TestReplayCollector.test_tier_intervals_and_masking) ... ok
+test_consecutive_scoring_and_alert (test_collector_sampling_response.TestResponseEngine.test_consecutive_scoring_and_alert) ... ok
+test_dry_run_and_rollback_action (test_collector_sampling_response.TestResponseEngine.test_dry_run_and_rollback_action) ... ok
+test_non_dry_run_throttle_callback (test_collector_sampling_response.TestResponseEngine.test_non_dry_run_throttle_callback) ... ok
+test_adjust_budget_shrink_and_grow (test_collector_sampling_response.TestSamplingController.test_adjust_budget_shrink_and_grow) ... ok
+test_assign_tiers_greedy_and_flagged_priority (test_collector_sampling_response.TestSamplingController.test_assign_tiers_greedy_and_flagged_priority) ... ok
+test_mock_measure_and_usage (test_collector_sampling_response.TestSelfMeter.test_mock_measure_and_usage) ... ok
+test_benign_has_no_false_positives (test_pipeline.TestAgentBehaviour.test_benign_has_no_false_positives) ... ok
+test_gate_catches_slow_ramp_but_plain_adaptive_does_not (test_pipeline.TestAgentBehaviour.test_gate_catches_slow_ramp_but_plain_adaptive_does_not) ... ok
+test_status_shape_matches_dashboard (test_pipeline.TestAgentBehaviour.test_status_shape_matches_dashboard) ... ok
+test_corroboration_merges_only_when_independent (test_pipeline.TestGate.test_corroboration_merges_only_when_independent) ... ok
+test_freezes_on_mean_shift_and_quarantines (test_pipeline.TestGate.test_freezes_on_mean_shift_and_quarantines) ... ok
+test_ttl_discards_buffer (test_pipeline.TestGate.test_ttl_discards_buffer) ... ok
+test_ewma_update (test_pipeline.TestGaussian.test_ewma_update) ... ok
+test_exact_merge_matches_batch (test_pipeline.TestGaussian.test_exact_merge_matches_batch) ... ok
+test_freeze_raises_desired_tier (test_pipeline.TestInterlock.test_freeze_raises_desired_tier) ... ok
+test_percentiles_and_empty (test_pipeline.TestLatency.test_percentiles_and_empty) ... ok
+test_contributions_rank_and_sum (test_pipeline.TestScorer.test_contributions_rank_and_sum) ... ok
+test_risk_levels_monotonic (test_pipeline.TestScorer.test_risk_levels_monotonic) ... ok
+test_context_fallback_to_coarse (test_pipeline.TestStore.test_context_fallback_to_coarse) ... ok
+test_lru_eviction (test_pipeline.TestStore.test_lru_eviction) ... ok
+test_snapshot_is_safe_during_mutation (test_pipeline.TestStore.test_snapshot_is_safe_during_mutation)
+Readers must not crash while the monitoring loop mutates the store. ... ok
+
+----------------------------------------------------------------------
+Ran 24 tests in 32.188s
+
+OK

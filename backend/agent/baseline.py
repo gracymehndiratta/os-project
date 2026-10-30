@@ -14,6 +14,7 @@ quarantine buffer and freeze bookkeeping (design §8 "KeyState").
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -278,6 +279,9 @@ class BaselineStore:
     def __init__(self, config: Optional[Config] = None) -> None:
         self.config = config or Config()
         self._states: "OrderedDict[BaselineKey, KeyState]" = OrderedDict()
+        # The monitoring loop mutates the store while API/WebSocket readers
+        # snapshot it, so all dict access is serialized.
+        self._lock = threading.RLock()
 
     # -- access -----------------------------------------------------------
     def get_or_create(
@@ -286,30 +290,32 @@ class BaselineStore:
         process_name: str = "",
         pid: int = 0,
     ) -> KeyState:
-        state = self._states.get(key)
-        if state is None:
-            ttl = int(self.config.gate.ttl_days * self.config.ticks_per_day)
-            state = KeyState(
-                key=key,
-                process_name=process_name,
-                pid=pid,
-                buffer=QuarantineBuffer(
-                    max_samples=self.config.gate.max_buffer_samples,
-                    ttl_ticks=ttl,
-                ),
-            )
-            self._states[key] = state
-            self._evict()
-        else:
-            self._states.move_to_end(key)
-            if process_name:
-                state.process_name = process_name
-            if pid:
-                state.pid = pid
-        return state
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                ttl = int(self.config.gate.ttl_days * self.config.ticks_per_day)
+                state = KeyState(
+                    key=key,
+                    process_name=process_name,
+                    pid=pid,
+                    buffer=QuarantineBuffer(
+                        max_samples=self.config.gate.max_buffer_samples,
+                        ttl_ticks=ttl,
+                    ),
+                )
+                self._states[key] = state
+                self._evict()
+            else:
+                self._states.move_to_end(key)
+                if process_name:
+                    state.process_name = process_name
+                if pid:
+                    state.pid = pid
+            return state
 
     def get(self, key: BaselineKey) -> Optional[KeyState]:
-        return self._states.get(key)
+        with self._lock:
+            return self._states.get(key)
 
     def resolve(self, key: BaselineKey) -> KeyState:
         """Return the baseline to *score against*.
@@ -318,15 +324,16 @@ class BaselineStore:
         coarse application baseline (design §4, step 4).  Creates the
         coarse fallback if neither exists.
         """
-        exact = self._states.get(key)
-        if exact is not None and exact.gate_state != GateState.LEARNING:
-            return exact
-        coarse_key = key.coarse()
-        if coarse_key != key:
-            coarse = self._states.get(coarse_key)
-            if coarse is not None and coarse.gate_state != GateState.LEARNING:
-                return coarse
-        return exact if exact is not None else self.get_or_create(key)
+        with self._lock:
+            exact = self._states.get(key)
+            if exact is not None and exact.gate_state != GateState.LEARNING:
+                return exact
+            coarse_key = key.coarse()
+            if coarse_key != key:
+                coarse = self._states.get(coarse_key)
+                if coarse is not None and coarse.gate_state != GateState.LEARNING:
+                    return coarse
+            return exact if exact is not None else self.get_or_create(key)
 
     # -- learning ---------------------------------------------------------
     def learn(self, state: KeyState, x: np.ndarray, tick: int) -> None:
@@ -346,7 +353,9 @@ class BaselineStore:
     def reconcile(self, pid: int, tick: int) -> int:
         """Merge quarantined samples after independent corroboration."""
         merged = 0
-        for state in self._states.values():
+        with self._lock:
+            states = list(self._states.values())
+        for state in states:
             if state.pid == pid and state.gate_state == GateState.FROZEN:
                 merged += self._merge_buffer(state, tick)
         return merged
@@ -367,7 +376,9 @@ class BaselineStore:
     def dismiss(self, pid: int, tick: int) -> int:
         """Discard quarantine for a PID; reset short baseline to long."""
         dropped = 0
-        for state in self._states.values():
+        with self._lock:
+            states = list(self._states.values())
+        for state in states:
             if state.pid == pid and state.gate_state == GateState.FROZEN:
                 dropped += state.buffer.size
                 state.buffer.clear()
@@ -381,16 +392,20 @@ class BaselineStore:
 
     # -- introspection ----------------------------------------------------
     def all_states(self) -> List[KeyState]:
-        return list(self._states.values())
+        with self._lock:
+            return list(self._states.values())
 
     def frozen_states(self) -> List[KeyState]:
-        return [s for s in self._states.values() if s.gate_state == GateState.FROZEN]
+        with self._lock:
+            return [s for s in self._states.values() if s.gate_state == GateState.FROZEN]
 
     def quarantine_count(self) -> int:
-        return sum(s.buffer.size for s in self._states.values())
+        with self._lock:
+            return sum(s.buffer.size for s in self._states.values())
 
     def active_buffer_count(self) -> int:
-        return sum(1 for s in self._states.values() if s.buffer.size > 0)
+        with self._lock:
+            return sum(1 for s in self._states.values() if s.buffer.size > 0)
 
     def _evict(self) -> None:
         cap = self.config.baseline.max_entries

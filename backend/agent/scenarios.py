@@ -53,6 +53,7 @@ def make_trace(
     attack: Optional[str] = None,
     attack_tick: int = 0,
     attack_span: int = 1440,
+    attack_duration: Optional[int] = None,
     legit_tick: Optional[int] = None,
     legit_factor: float = 1.8,
     seed: int = 0,
@@ -94,7 +95,7 @@ def make_trace(
                 vals[2] += base[2] * 3.0 * p
                 vals[3] += base[3] * 2.0 * p
             elif attack == "spike":
-                if age < 60:
+                if age < (attack_duration or 60):
                     vals[0] += 60.0
                     vals[2] += 40.0
                     vals[3] += 20.0
@@ -167,6 +168,23 @@ def demo_scenario(n_ticks: int = 100000) -> Scenario:
     )
 
 
+def single_alert_scenario(n_ticks: int = 100000) -> Scenario:
+    """One short attack episode that then settles (quiet dashboard demo)."""
+    traces = benign_traces()
+    traces.append(
+        make_trace(
+            "exploit_py", 1008, [1.0, 38.0, 5.0, 3.0, 0.0],
+            attack="spike", attack_tick=120, attack_duration=4,
+            seed=600, parent="launchd",
+        )
+    )
+    return Scenario(
+        name="single_alert", traces=traces,
+        attacker_apps={application_id("exploit_py")},
+        attack_tick=120, n_ticks=n_ticks,
+    )
+
+
 def benign_scenario(n_ticks: int = 2 * TICKS_PER_DAY) -> Scenario:
     return Scenario(name="benign", traces=benign_traces(), n_ticks=n_ticks)
 
@@ -225,6 +243,7 @@ def overhead_scenario(n_processes: int = 200, n_ticks: int = 600) -> Scenario:
 
 SCENARIOS: Dict[str, Callable[..., Scenario]] = {
     "demo": demo_scenario,
+    "single_alert": single_alert_scenario,
     "benign": benign_scenario,
     "slow_ramp": slow_ramp_scenario,
     "evading_ramp": evading_ramp_scenario,
@@ -244,6 +263,7 @@ __all__ = [
     "make_trace",
     "benign_traces",
     "demo_scenario",
+    "single_alert_scenario",
     "benign_scenario",
     "slow_ramp_scenario",
     "evading_ramp_scenario",

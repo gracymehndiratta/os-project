@@ -21,7 +21,7 @@ from .agent import MonitorAgent
 from .config import Config
 from .data_model import Tier
 from .models import AgentStatus, Alert, Baseline, ProcessInfo, RollbackActionModel
-from .scenarios import demo_scenario
+from .scenarios import get_scenario
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +32,21 @@ logger = logging.getLogger(__name__)
 
 def _build_agent() -> MonitorAgent:
     live = os.environ.get("OSMON_LIVE", "0") == "1"
+    # Tick interval is configurable so the simulated demo can be sped up for
+    # screenshots (OSMON_TICK_INTERVAL=0.05) or slowed for a live demo.
+    try:
+        interval = float(os.environ.get("OSMON_TICK_INTERVAL", "0.5"))
+    except ValueError:
+        interval = 0.5
+    # Choose the replay scenario with OSMON_SCENARIO (default: the four-attack
+    # demo). ``single_alert`` fires one short burst and then settles.
+    scenario_name = os.environ.get("OSMON_SCENARIO", "demo")
     return MonitorAgent(
         config=Config(),
         simulation=not live,
-        scenario=None if live else demo_scenario(),
+        scenario=None if live else get_scenario(scenario_name),
         model_overhead=not live,
-        tick_interval=0.5,
+        tick_interval=interval,
     )
 
 

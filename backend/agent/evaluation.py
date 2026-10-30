@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .agent import MonitorAgent
 from .config import Config
@@ -44,6 +44,10 @@ VARIANTS: Dict[str, Dict[str, Any]] = {
     "gate_only":      dict(enable_gate=True,  enable_budget=False, learning="adaptive"),
     "budget_only":    dict(enable_gate=False, enable_budget=True,  learning="adaptive"),
     "full":           dict(enable_gate=True,  enable_budget=True,  learning="adaptive"),
+    # Isolation forest is Review 1 §6 prior work, evaluated here as an
+    # ablation: no gate and no budget, refit on a sliding window per key.
+    "iforest":        dict(enable_gate=False, enable_budget=False, learning="adaptive",
+                           detector="iforest"),
 }
 
 
@@ -220,6 +224,31 @@ def format_results(results: List[EvalResult]) -> str:
     return "\n".join(lines)
 
 
+def _scenario_builders(quick: bool) -> Dict[str, Callable[[], Scenario]]:
+    """Return the scenario builders for a run configuration.
+
+    ``run_all`` calls a builder **once per variant**.  The replay traces carry
+    a per-trace RNG whose state advances on every sample, so reusing one
+    ``Scenario`` across variants would feed each variant a different noise
+    stream and confound the ablation.
+    """
+    if quick:
+        return {
+            "benign": lambda: benign_scenario(TICKS_PER_DAY),
+            "slow_ramp": lambda: slow_ramp_scenario(2 * TICKS_PER_DAY),
+            "evading_ramp": lambda: evading_ramp_scenario(3 * TICKS_PER_DAY),
+            "legit_step": lambda: legit_step_scenario(3 * TICKS_PER_DAY),
+            "overhead": lambda: overhead_scenario(60, 300),
+        }
+    return {
+        "benign": lambda: benign_scenario(2 * TICKS_PER_DAY),
+        "slow_ramp": lambda: slow_ramp_scenario(3 * TICKS_PER_DAY),
+        "evading_ramp": lambda: evading_ramp_scenario(6 * TICKS_PER_DAY),
+        "legit_step": lambda: legit_step_scenario(3 * TICKS_PER_DAY),
+        "overhead": lambda: overhead_scenario(200, 600),
+    }
+
+
 def run_all(
     variants: Optional[List[str]] = None,
     scenarios: Optional[List[str]] = None,
@@ -227,28 +256,14 @@ def run_all(
 ) -> List[EvalResult]:
     variants = variants or list(VARIANTS)
     scenarios = scenarios or ["benign", "slow_ramp", "evading_ramp", "legit_step", "overhead"]
-
-    if quick:
-        builders = {
-            "benign": lambda: benign_scenario(TICKS_PER_DAY),
-            "slow_ramp": lambda: slow_ramp_scenario(2 * TICKS_PER_DAY),
-            "evading_ramp": lambda: evading_ramp_scenario(3 * TICKS_PER_DAY),
-            "legit_step": lambda: legit_step_scenario(3 * TICKS_PER_DAY),
-            "overhead": lambda: overhead_scenario(60, 300),
-        }
-    else:
-        builders = {
-            "benign": lambda: benign_scenario(2 * TICKS_PER_DAY),
-            "slow_ramp": lambda: slow_ramp_scenario(3 * TICKS_PER_DAY),
-            "evading_ramp": lambda: evading_ramp_scenario(6 * TICKS_PER_DAY),
-            "legit_step": lambda: legit_step_scenario(3 * TICKS_PER_DAY),
-            "overhead": lambda: overhead_scenario(200, 600),
-        }
+    builders = _scenario_builders(quick)
 
     results: List[EvalResult] = []
     for sname in scenarios:
-        scenario = builders[sname]()
         for vname in variants:
+            # Fresh scenario per variant: identical data stream for a fair
+            # comparison (the trace RNG is stateful).
+            scenario = builders[sname]()
             logger.info("running scenario=%s variant=%s ticks=%d", sname, vname, scenario.n_ticks)
             results.append(
                 evaluate(scenario, vname, corroborate=(sname == "legit_step"))

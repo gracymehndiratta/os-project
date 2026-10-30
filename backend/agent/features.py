@@ -38,10 +38,15 @@ _TIME_BUCKETS = [
 def time_bucket(ts: Optional[float] = None) -> str:
     """Return a coarse time-of-day label for a Unix timestamp.
 
-    Prevents a midnight cron job from being scored against a daytime
+    The bucket is computed in **UTC** so replay context keys are deterministic
+    and independent of the machine timezone (``_sim_ts`` builds timestamps
+    from the simulated tick, which would otherwise be shifted by the local
+    offset).  Prevents a midnight cron job from being scored against a daytime
     interactive baseline.
     """
-    t = datetime.datetime.fromtimestamp(ts if ts is not None else time.time())
+    t = datetime.datetime.fromtimestamp(
+        ts if ts is not None else time.time(), tz=datetime.timezone.utc
+    )
     for lo, hi, label in _TIME_BUCKETS:
         if lo <= t.hour < hi:
             return label
